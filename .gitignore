@@ -1,0 +1,42 @@
+**/__pycache__/
+.boyoclaw/
+.sandbox/
+.env
+# Bytecode and build artifacts for CPython projects
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+build/
+dist/
+.eggs/
+*.egg-info/
+# VSCode Python artifacts
+.vscode/
+#mypy outputs
+.mypy_cache/
+# Pytest cache
+.pytest_cache/
+# Cython build artifacts
+cython_debug/
+# pipenv/poetry/virtualenvs
+Pipfile.lock
+poetry.lock
+.venv/
+env/
+venv/
+ENV/
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+# ipython/jupyter
+.ipynb_checkpoints/
+*.ipynb
+*.cpython*
+__pycache__/*.cpython*

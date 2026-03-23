@@ -1,0 +1,5 @@
+# Core agent / runtime (install rest from your env as needed)
+rich>=13.0
+python-telegram-bot>=21.0
+deepagents>=0.4.12
+langchain-ollama
