@@ -459,12 +459,20 @@ class BoyoClawRuntime:
         )
         return should_run, todos_path
 
-    async def run_forever(self, *, enable_telegram: bool = False) -> None:
+    async def _headless_stdin_placeholder(self) -> None:
+        """Keep the process alive without reading stdin (launchd has no TTY)."""
+        await self._shutdown.wait()
+
+    async def run_forever(self, *, enable_telegram: bool = False, headless: bool = False) -> None:
         self._loop = asyncio.get_running_loop()
 
         await self._print_status(
             "[bold]BoyoClaw[/bold] — workspace: %s" % self.sandbox_root,
         )
+        if headless:
+            await self._print_status(
+                "[dim]Headless mode: no local stdin (Telegram or other queues only).[/dim]",
+            )
 
         should_wake, _todos = await self._wake_maintenance()
         if should_wake:
@@ -507,14 +515,21 @@ class BoyoClawRuntime:
                     )
                     tg_task = asyncio.create_task(_telegram_guard())
 
-        await asyncio.gather(
-            self._input_loop(),
-            self._agent_worker(),
-            *([] if tg_task is None else [tg_task]),
-        )
+        if headless:
+            await asyncio.gather(
+                self._headless_stdin_placeholder(),
+                self._agent_worker(),
+                *([] if tg_task is None else [tg_task]),
+            )
+        else:
+            await asyncio.gather(
+                self._input_loop(),
+                self._agent_worker(),
+                *([] if tg_task is None else [tg_task]),
+            )
 
 
-async def async_main(*, enable_telegram: bool = False) -> None:
+async def async_main(*, enable_telegram: bool = False, headless: bool = False) -> None:
     logging.basicConfig(level=logging.WARNING)
     _src = Path(__file__).resolve().parent.parent
     if str(_src) not in sys.path:
@@ -528,7 +543,7 @@ async def async_main(*, enable_telegram: bool = False) -> None:
         model=model,
         system_prompt="You are BoyoClaw, a capable agent. Follow the BoyoClaw interaction rules.",
     )
-    await rt.run_forever(enable_telegram=enable_telegram)
+    await rt.run_forever(enable_telegram=enable_telegram, headless=headless)
 
 
 async def main() -> None:

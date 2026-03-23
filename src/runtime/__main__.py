@@ -40,11 +40,19 @@ def main() -> None:
         action="store_true",
         help="Run Telegram bot sidecar (requires telegram.json; run: telegram configure)",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Do not read stdin (for launchd/systemd). Use with --telegram; no local › prompt.",
+    )
     ns = parser.parse_args(argv)
+    if ns.headless and not ns.telegram:
+        print("--headless requires --telegram (nothing would enqueue user work otherwise).", file=sys.stderr)
+        raise SystemExit(2)
 
     from runtime.loop import async_main
 
-    asyncio.run(async_main(enable_telegram=ns.telegram))
+    asyncio.run(async_main(enable_telegram=ns.telegram, headless=ns.headless))
 
 
 if __name__ == "__main__":

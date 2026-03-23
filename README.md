@@ -2,6 +2,16 @@
 
 Local **Deep Agents** runtime with a sandboxed workspace, Rich terminal UI, optional **Telegram** bot, and a **SQLite + FAISS** message inbox (semantic search via Ollama embeddings).
 
+Capabilities:
+- Background agent worker with a loop.
+- Temrminal and Telegram bot support.
+- Semantic inbox search.
+- Docker isolated execution.
+- Shell and filesystem tools.
+- Skills support for docx, pdf, xlsx, agent-browser, etc.
+- Long term memory management.
+
+Note: Built and tested only on MacOS.
 ---
 
 ## What you get
@@ -138,6 +148,21 @@ python -m runtime --telegram
 - Same terminal prompt for local messages.
 - Telegram messages are queued the same way; `reply_to_human` is delivered to the chat that messaged (authorized ids only).
 - File uploads from Telegram are stored under `telegram_uploads/` and merged into the **next text message** for that chat.
+
+### macOS `launchd` (background Telegram bot)
+
+`launchd` has **no TTY**; reading stdin hits EOF and would stop the old runtime immediately. Use **`--telegram --headless`** so the process stays up and only Telegram (and the agent queue) drives work.
+
+1. Copy `launchd/com.boyoclaw.runtime.plist.example` to `~/Library/LaunchAgents/com.boyoclaw.runtime.plist`.
+2. Edit **absolute paths**: repo root as `WorkingDirectory`, venv `python` in `ProgramArguments`, log paths under `/Users/you/Library/Logs/...` (create the folder first).
+3. Load and start:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.boyoclaw.runtime.plist
+launchctl start com.boyoclaw.runtime
+```
+
+Stop / unload: `launchctl stop com.boyoclaw.runtime` then `launchctl unload ~/Library/LaunchAgents/com.boyoclaw.runtime.plist`.
 
 ### Wake behavior
 
