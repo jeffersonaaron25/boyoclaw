@@ -7,12 +7,18 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from agent import SandboxedAssistant, default_sandbox_directory, is_loop_control_message, project_root
+from agent import (
+    SandboxedAssistant,
+    agent_home_directory,
+    default_sandbox_directory,
+    is_loop_control_message,
+    project_root,
+)
 from inbox.store import MessageInbox
 from inbox.tools import build_inbox_tools
 from runtime.todos import (
@@ -27,6 +33,40 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Default: periodic Wake Up on this interval (first fire after one full interval from process start).
+PERIODIC_WAKE_INTERVAL_SEC = 3 * 3600
+
+# Appended to system context only for timer-driven periodic wakes (not user chat).
+PERIODIC_WAKE_SYSTEM_APPENDIX = """
+## Periodic wake (this turn only — runtime timer, not interactive chat)
+This wake runs on a fixed interval. The user is **not** waiting at the screen unless you notify them.
+- **Quickly** read **`TODOS.md`** and decide if anything needs doing. Use **`fetch_unread_messages`** only when the checklist or obvious context requires it.
+- **Do not** call **`send_message`** unless something **requires** the human (deadline, blocker, risk, or a decision only they can make).
+- Do quiet work (edit todos, files, memory) without narrating. When there is **nothing** the user must see, do **not** use **`send_message`** and your **final** assistant message must be exactly the single word **`SILENT`** (uppercase). The runtime will not show **`SILENT`** to the user or store it as a user-visible reply.
+- If you used **`send_message`** because you had to alert them, you may still end your final turn with **`SILENT`** if there is no further text needed (or leave a minimal closing line — prefer **`SILENT`** alone when done).
+"""
+
+
+def _periodic_output_suppressed(text: str | None) -> bool:
+    """True when periodic wake should emit nothing to inbox/terminal/Telegram."""
+    if text is None:
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    # Single-token SILENT (allow trailing punctuation from sloppy models)
+    return s.casefold().rstrip(".!") == "silent"
+
+
+def _agent_pause_command_kind(text: str) -> Literal["pause", "resume"] | None:
+    """Terminal/Telegram slash commands for global agent pause (no wakes, no replies)."""
+    s = text.strip().lower()
+    if s in ("/agent-pause", "/agent_pause"):
+        return "pause"
+    if s in ("/agent-resume", "/agent_resume"):
+        return "resume"
+    return None
+
 
 def _user_message_is_wake_up(user_message: str) -> bool:
     """True when this turn is a Wake Up run (internal or user-typed), including Wake + Telegram upload suffix."""
@@ -38,8 +78,29 @@ def _user_message_is_wake_up(user_message: str) -> bool:
     return norm == "wake up"
 
 
-MYCLAW_RUNTIME_PROMPT = """
+BOYOCLAW_RUNTIME_PROMPT = """
 Current date and time: {current_date_time}
+
+## Agent workspace vs system files
+- Your **file and shell tools** are confined to **``.agent-home``** (that directory is your workspace root for paths like ``MEMORY.md``, ``TODOS.md``, ``skills/``, etc.).
+- **Outside** that folder (same parent directory) the runtime keeps **system data** you must **not** assume you can list or open: ``inbox/`` (message store), ``telegram.json``, ``scheduled_wakes.json``.
+- Inbox content is only through **fetch_unread_messages**, **read_recent_messages**, and **search_messages**.
+
+## Skills paths: file tools vs ``execute``
+- File tools (``read_file``, ``glob``, filesystem ``ls``) should use skills paths under ``/skills/project/...``. Do not rewrite skill paths to host absolute paths like ``/Users/...``.
+- ``execute`` is a real shell. In Docker, ``$HOME`` is the **inner** agent copy at ``/mnt/workspace/.agent-home`` (synced with the user-facing host ``.agent-home``). Use shell paths like ``$HOME/skills/project/...``.
+- Do not pass shell-only paths (for example ``$HOME/...`` or ``/mnt/workspace/.agent-home/...``) into ``read_file``. Use ``/skills/...`` with file tools, and use ``$HOME`` paths only with ``execute``.
+- To locate files for shell commands, search under ``$HOME``. Do not run ``find /`` (slow, often times out).
+
+## Apple Calendar scripting guardrails
+- For Calendar events in AppleScript, use ``start date`` and ``end date`` fields. Avoid ``date of event``.
+- Prefer bounded queries like ``every event whose start date is greater than or equal to t0 and start date is less than or equal to t1``.
+- Do not hide Calendar errors behind blanket ``try/on error`` blocks. Surface stderr and simplify to one minimal diagnostic script when results are unexpectedly empty.
+
+## Turn context (interactive messages only — not the full conversation)
+- When the **human has just sent a message** via the terminal or Telegram, the **message list** may include up to **three prior** human/assistant turns **before** that message. That is a **short tail only**—not a complete transcript. **Scheduled wakes, startup wakes, and other internal wakes do not include this tail.**
+- In those interactive turns, a **Semantic snippets** system section may list up to three excerpts from older messages (similarity-ranked). Those snippets are **not** exhaustive and may be out of order—use **read_recent_messages** or **search_messages** when you need reliable or complete history.
+- A **periodic Wake Up** runs every **3 hours** by default (runtime timer). On that turn you get extra instructions: quick **TODOS.md** check, **`send_message`** only if truly needed; otherwise end with exactly **`SILENT`** so the user sees nothing.
 
 ## BoyoClaw interaction rules
 - Interactive terminal: the user already sees what they typed. Answer that line directly in a natural chat tone.
@@ -55,41 +116,50 @@ Current date and time: {current_date_time}
 These are **runtime housekeeping**, not the user's personal task list.
 
 - In normal chat (e.g. "what's up?", "got any todos?", small talk): **do not** list, summarize, number, or offer to work through these three defaults. Treat them as invisible in replies.
-- If asked broadly whether they have todos: mention **only** other, non-default items you see in `TODOS.md` after `read_file`; if there are none, say they have no extra todos (you may briefly note the system keeps an internal checklist—one short clause—without enumerating it).
-- Only discuss those three items in detail if the user explicitly asks about the wake checklist, inbox workflow, or editing that section of `TODOS.md`.
+- If asked broadly whether they have todos: mention **only** other, non-default items you see in **`TODOS.md`** after **`read_file`**; if there are none, say they have no extra todos (you may briefly note the system keeps an internal checklist—one short clause—without enumerating it).
+- Only discuss those three items in detail if the user explicitly asks about the wake checklist, inbox workflow, or editing that section of **`TODOS.md`**.
 
-- On receiving "Wake Up" message:
-    1. Optionally read `TODOS.md` for context; do not recite the default three to the user.
+- On receiving "Wake Up" message (or from the user on terminal/Telegram, **not** the periodic timer):
+    1. Optionally read **`TODOS.md`** for context; do not recite the default three to the user.
     2. Use `fetch_unread_messages` and update todos as required by the workflow.
-    3. Use `reply_to_human` for a concise status if needed; then continue real work.
+    3. Use `send_message` for a concise status if needed; then continue real work. This is mandatory when you use long running tools, skills or perform complex tasks.
+    4. **Acknowledgements (strict):** Send **at most one** short acknowledgement before heavy work (multi-step tools, skills, or >~30s of work): one sentence—receipt + what you will do. **Do not** acknowledge simple questions, one-shot answers, or trivia. **Do not** send “Got it / On it / Working on it” twice in the same turn. After work finishes, send **one** final `send_message` with the outcome (or stay silent if there is nothing user-facing). On **terminal** interactive lines, the user already sees their text—skip redundant preamble unless you are about to run slow tools.
 - On receiving "Go to Sleep" message:
     1. Update todos to mark only incomplete tasks as remaining.
     2. Finish the response appropriately (do not treat as a normal user message).
-- For each normal user message in the terminal, prefer a single clear `reply_to_human` with your answer.
-  Use a short receipt first only if you are about to run tools that take noticeable time; then send one final `reply_to_human`.
-- When completing a todo, mark it as completed in TODOS.md using [x] notation.
+- When completing a todo, mark it as completed in **`TODOS.md`** using `[x]` notation (via your normal file tools).
 - Do not treat "Wake Up" or "Go to Sleep" as user mail; they are control messages (not stored in the inbox).
-- Do not repeat the same substantive answer twice in one turn (avoid duplicate `reply_to_human` content).
-- Some messages arrive from **Telegram** (authorized chats). Replies still go through `reply_to_human`; they are delivered to that Telegram chat. Do not tell the user to "check the terminal" when they wrote from Telegram.
-- Files users send via Telegram are saved under `telegram_uploads/<date>/` and are attached to their **next text message** (uploads alone do not run the agent). The composed user message lists relative paths—read or process them when relevant.
-- When the user is on **Telegram** and needs a file you created, call `send_file_to_user` with a **workspace-relative path** (and optional caption). For **terminal-only** users, do not use that tool—give them the path in `reply_to_human` instead. Large files may exceed Telegram limits; say so if send fails.
+- Do not repeat the same substantive answer twice in one turn (avoid duplicate `send_message` content).
+- Some messages arrive from **Telegram** (authorized chats). Replies still go through `send_message`; they are delivered to that Telegram chat. Do not tell the user to "check the terminal" when they wrote from Telegram.
+- Files users send via Telegram are saved under **`telegram_uploads/<date>/`** inside your **agent workspace** (``.agent-home``). By default they are attached to the **next text message**; **voice uploads** start a turn immediately with the saved file path attached. The composed user message lists relative paths—read or process them when relevant. 
+- When the user is on **Telegram** and needs a file you created, call `send_file_to_user` with a **path relative to the agent workspace** (and optional caption). For **terminal-only** users, do not use that tool—give them the path in `send_message` instead. Large files may exceed Telegram limits; say so if send fails.
+- **Audio:** Use **kokoro-tts-telegram** (TTS) and **audio-stt-faster-whisper** (STT); see those skills.
+- **Skills / long tasks:** If the turn needs a skill or clearly multi-step work, you may send **one** acknowledgement line first (see rules above), then execute, then **one** closing `send_message`. If the task is quick or obvious, **skip** the acknowledgement and answer once.
+- **Simple chat:** For normal Q&A or short requests, use **a single** `send_message` with the answer—no separate acknowledgement paragraph.
 
-## MEMORY.md
-- The **full text of `MEMORY.md`** is appended to your system instructions (after these rules). Treat it as long-term workspace memory unless the user contradicts it. Prefer **short, durable** entries; append or tighten rather than pasting huge transcripts.
-- If you see a **size warning** above the MEMORY block, prioritize **rewriting `MEMORY.md` into a compact form** (essential facts only, compact notation) when you touch that file.
-- If user asks you to do routine tasks, you must add to memory and ensure you add them to your TODOS.md and execute them at the interval of user choice. Ensure you get the relevant information from user before adding to memory.
-- Save user preferences, your learnings and experiences in MEMORY.md if it is relevant to your long term memory.
-- Proactively store memory when appropriate, and ensure it is compact and relevant to what you need to remember long term.
-- You can store user preferences (what they like, what they dislike, what they are interested in, what they are not interested in, etc.), your learnings (what you have learned from the user, what you have learned from the user's preferences, etc.), and your experiences (what you have experienced, what you have learned from the user's preferences, etc.) in MEMORY.md if it is relevant to your long term memory.
-- Model your personality and behavior based on memory.
+## MEMORY.md (strict)
+- The **full text of `MEMORY.md`** is appended after these rules. Treat it as **durable workspace memory**; if the user contradicts a stored fact, follow the user and **update** the file.
+- **Update without being asked** only when the user **states** something worth persisting: name/preferences, standing instructions, recurring schedule facts, important corrections, or explicit “remember this”. **Do not** add speculative psychology, play-by-play chat, one-off task detail, or duplicate facts already in MEMORY.
+- **How to write:** One line per fact with date; no essays. Prefer **append** or **edit in place**. If the file grows long or you see a **size warning**, **compress** to essential bullets on the next edit.
+- **When not to touch MEMORY:** Pure small talk, one-turn questions, or items that belong only in **`TODOS.md`** or another project file—use the right place instead.
+- **Routine tasks / reminders:** If the user asks for recurring work, capture what you need in MEMORY and/or **`TODOS.md`** and confirm intervals with them before promising automation.
+- Let MEMORY inform tone and consistency; do not recite MEMORY back unless they ask what is stored.
 
-## Workspace hygiene
-- Keep the sandbox lean: remove **scratch**, **temporary**, and **duplicate** outputs you no longer need (old exports, repeated downloads, abandoned build dirs) once a task is done or superseded.
-- Do **not** delete the user's inbox, long-term notes, `Memory/`, or project source unless they clearly asked or you confirmed it is disposable.
-- Prefer one canonical artifact over many copies; if you regenerate a file, delete or replace the obsolete version.
+## Workspace hygiene (strict)
+- **Scope:** Your writable tree is **``.agent-home``** (and paths the user clearly treats as theirs under it). Never delete or edit **inbox/**, **telegram.json**, **scheduled_wakes.json**, or anything outside what your tools can open.
+- **After a task:** Remove **your** scratch dirs, duplicate downloads, superseded exports, and obsolete **``outputs/``** or **``telegram_uploads/``** files you created or that are clearly safe to drop (e.g. old dated uploads you already processed and no longer need). **Do not** delete the only copy of something the user might want, **MEMORY.md**, **TODOS.md**, or user-authored notes unless they asked or agreed.
+- **One canonical artifact:** If you regenerate a deliverable, **delete or overwrite** the old version so the workspace does not accumulate numbered copies unless the user wants history.
+- **Large or sensitive files:** Do not hoard big binaries; if an intermediate file is no longer needed for the next step, remove it in the same session when reasonable.
+
+## Shell ``execute`` (sandbox policy)
+- Host shell commands are **filtered** before they run: **sudo/doas**, **system-wide rm**, **disk erase**, **shutdown/reboot**, **curl/wget piped to shell**, and similar patterns are **blocked**. You will see a clear message and exit code 126 when blocked.
+- Do **not** ask the user to turn off ``BOYOCLAW_SHELL_POLICY`` unless they explicitly want unsafe mode and understand the risk.
+- This does **not** replace the user's responsibility: the policy is best-effort pattern matching, not a full security guarantee.
 
 ## Response Formatting
+- Whenever you have a message from user (fetch_unread_messages or directly from telegram), you should acknowledge the message with a reply if it includes some work on your end (like reading files, using skills, etc.).
 - Do not use markdown formatting, use appropriate formatting for clear readability on telegram and terminal which do not support markdown.
+- Do not use *bold* or other formatting.
 """
 
 
@@ -128,8 +198,11 @@ class BoyoClawRuntime:
         ollama_base_url: str | None = None,
         recursion_limit: int = 300,
     ) -> None:
+        logger.info("Initializing BoyoClawRuntime with sandbox_root: %s", sandbox_root)
         self.sandbox_root = (sandbox_root or default_sandbox_directory()).resolve()
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
+        self.agent_home = agent_home_directory(self.sandbox_root)
+        self.agent_home.mkdir(parents=True, exist_ok=True)
         self._recursion_limit = recursion_limit
         self._human_queue: asyncio.Queue[QueuedTurn] = asyncio.Queue()
         self._shutdown = asyncio.Event()
@@ -144,6 +217,8 @@ class BoyoClawRuntime:
         self._telegram_pending_uploads: dict[int, list[tuple[str, str]]] = {}
         # After a Wake driven by non-placeholder todos, same todo set → same fingerprint → no repeat Wake.
         self._last_todo_wake_fingerprint: str = ""
+        # When True: no _run_agent_turn (wakes, replies, scheduled, periodic). Telegram still polls; /agent-resume clears.
+        self._agent_paused: bool = False
 
         self.inbox = MessageInbox(
             self.sandbox_root / "inbox",
@@ -153,9 +228,9 @@ class BoyoClawRuntime:
 
         combined = (system_prompt or "").strip()
         if combined:
-            combined = combined + "\n\n" + MYCLAW_RUNTIME_PROMPT.format(current_date_time=datetime.now().isoformat())
+            combined = combined + "\n\n" + BOYOCLAW_RUNTIME_PROMPT.format(current_date_time=datetime.now().isoformat())
         else:
-            combined = MYCLAW_RUNTIME_PROMPT.strip()
+            combined = BOYOCLAW_RUNTIME_PROMPT.strip()
 
         tools = build_inbox_tools(
             self.inbox,
@@ -171,6 +246,7 @@ class BoyoClawRuntime:
             system_prompt=combined,
             extra_tools=tools,
             debug=True,
+            prefer_docker_isolation=True,
         )
 
     def _ensure_console(self) -> None:
@@ -185,7 +261,7 @@ class BoyoClawRuntime:
         asyncio.run_coroutine_threadsafe(self._async_print_ack(message), self._loop)
 
     def _sync_reply_ui(self, message: str) -> None:
-        """Deliver reply_to_human to Rich and/or Telegram (inbox row already added in tool)."""
+        """Deliver send_message to Rich and/or Telegram (inbox row already added in tool)."""
         if self._loop is None:
             return
         cid = self._pending_telegram_chat_id
@@ -207,13 +283,13 @@ class BoyoClawRuntime:
             return (
                 False,
                 "The user is not on Telegram in this turn. Tell them the workspace-relative path "
-                "to the file in reply_to_human (they are using the terminal).",
+                "to the file in send_message (they are using the terminal).",
             )
         if app is None:
             return (
                 False,
                 "Telegram is not connected (--telegram not used or bot not running). "
-                "Give the user the file path in reply_to_human instead.",
+                "Give the user the file path in send_message instead.",
             )
         if self._loop is None:
             return False, "Runtime event loop is not ready; cannot send file."
@@ -221,7 +297,7 @@ class BoyoClawRuntime:
             self._telegram_deliver_workspace_file(cid, app, rel, caption),
             self._loop,
         )
-        return True, "Started uploading the file to the user's Telegram chat. You can still summarize in reply_to_human."
+        return True, "Started uploading the file to the user's Telegram chat. You can still summarize in send_message."
 
     async def _telegram_deliver_workspace_file(
         self,
@@ -232,7 +308,7 @@ class BoyoClawRuntime:
     ) -> None:
         from runtime.telegram_bot import send_plain_text, send_workspace_file
 
-        root = self.sandbox_root.resolve()
+        root = self.agent_home.resolve()
         cleaned = rel.strip().replace("\\", "/")
         if not cleaned or ".." in Path(cleaned).parts:
             await send_plain_text(app.bot, chat_id, f"Invalid path for send_file_to_user: {rel!r}")
@@ -301,6 +377,12 @@ class BoyoClawRuntime:
     def shutdown(self) -> asyncio.Event:
         return self._shutdown
 
+    def agent_paused(self) -> bool:
+        return self._agent_paused
+
+    def set_agent_paused(self, paused: bool) -> None:
+        self._agent_paused = paused
+
     def attach_telegram_application(self, app: Any) -> None:
         self._telegram_app = app
 
@@ -367,6 +449,54 @@ class BoyoClawRuntime:
             "Use their name when it fits the reply. If the user has a preferred name in your memory, use that instead of the Telegram display name."
         )
 
+    def _inbox_rows_to_lc(self, rows: list[dict[str, Any]]) -> list[HumanMessage | AIMessage]:
+        out: list[HumanMessage | AIMessage] = []
+        for r in rows:
+            if r.get("type") == "human":
+                out.append(HumanMessage(content=str(r.get("content", ""))))
+            else:
+                out.append(AIMessage(content=str(r.get("content", ""))))
+        return out
+
+    def _retrieval_system_block(self, query: str, exclude_message_id: str | None) -> str:
+        """Up to 3 semantically similar past messages; labeled so the model does not treat as full history."""
+        q = (query or "").strip()
+        if len(q) > 8000:
+            q = q[:8000]
+        if not q:
+            q = "."
+        try:
+            rows = self.inbox.search_semantic(q, limit=8)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Semantic retrieval for turn failed: %s", e)
+            return ""
+        if exclude_message_id:
+            rows = [r for r in rows if r.get("id") != exclude_message_id]
+        rows = rows[:3]
+        if not rows:
+            return ""
+        rows.sort(key=lambda r: str(r.get("created_at", "")))
+        lines = [
+            "## Semantic snippets from past messages (NOT the full conversation)",
+            "",
+            "Up to three excerpts chosen by similarity to the current message, then **sorted oldest → newest** by "
+            "timestamp. They may be incomplete or omit relevant context. This is not a transcript—use "
+            "`read_recent_messages` or `search_messages` when you need reliable history. This is intended to give you a "
+            "starting point to search for messages if required. ",
+            "Do not assume you don't have information until you have searched with `search_messages` and/or `read_recent_messages`."
+            "",
+        ]
+        for i, r in enumerate(rows, 1):
+            role = "Human" if r.get("type") == "human" else "Assistant"
+            ts = str(r.get("created_at", ""))[:19]
+            content = str(r.get("content") or "").strip()
+            if len(content) > 1500:
+                content = content[:1500] + "…"
+            lines.append(f"### Snippet {i} ({role}, {ts})")
+            lines.append(content)
+            lines.append("")
+        return "\n".join(lines).strip()
+
     async def _process_one(self, turn: QueuedTurn) -> None:
         self._pending_telegram_chat_id = turn.telegram_chat_id
         try:
@@ -380,6 +510,27 @@ class BoyoClawRuntime:
                 self._cli_prompt_allowed.set()
                 return
 
+            ap = _agent_pause_command_kind(text or "")
+            if ap == "pause":
+                self.set_agent_paused(True)
+                await self._print_status(
+                    "[dim]Agent paused — no wakes or agent replies. Send /agent-resume to continue.[/dim]",
+                )
+                self._cli_prompt_allowed.set()
+                return
+            if ap == "resume":
+                self.set_agent_paused(False)
+                await self._print_status("[dim]Agent resumed.[/dim]")
+                self._cli_prompt_allowed.set()
+                return
+
+            if self._agent_paused:
+                await self._print_status(
+                    "[dim]Agent is paused. Send /agent-resume or /agent_resume to continue.[/dim]",
+                )
+                self._cli_prompt_allowed.set()
+                return
+
             await self._print_status("Agent running…")
             self._cli_prompt_allowed.set()
 
@@ -390,14 +541,19 @@ class BoyoClawRuntime:
                     composed,
                     announce=False,
                     system_appendix=self._telegram_system_appendix(turn),
+                    interaction_turn=True,
+                    tail_mode="no_new_human",
                 )
                 return
 
-            self.inbox.add_human(composed, unread=False)
+            new_id = self.inbox.add_human(composed, unread=False)
             await self._run_agent_turn(
                 composed,
                 announce=False,
                 system_appendix=self._telegram_system_appendix(turn),
+                interaction_turn=True,
+                tail_mode="after_new_human",
+                new_human_message_id=new_id,
             )
         finally:
             self._pending_telegram_chat_id = None
@@ -408,20 +564,49 @@ class BoyoClawRuntime:
         *,
         announce: bool = True,
         system_appendix: str | None = None,
+        interaction_turn: bool = False,
+        tail_mode: Literal["after_new_human", "no_new_human"] = "no_new_human",
+        new_human_message_id: str | None = None,
+        periodic_wake: bool = False,
     ) -> bool:
         async with self._agent_turn_lock:
             if self._assistant is None:
                 return False
+            if self._agent_paused:
+                return False
             if _user_message_is_wake_up(user_message):
                 self._sync_todos_wake_file_prep()
             self._delivery.reply_via_tool = False
+            prior_lc: list[HumanMessage | AIMessage] = []
+            retrieval_block: str | None = None
+            if interaction_turn:
+                if tail_mode == "after_new_human":
+                    prior_rows = self.inbox.fetch_messages_before_newest(count=3)
+                else:
+                    prior_rows = self.inbox.fetch_recent_messages(
+                        limit=3,
+                        mark_read_in_window=False,
+                    )
+                prior_lc = self._inbox_rows_to_lc(prior_rows)
+                exclude_id = new_human_message_id if tail_mode == "after_new_human" else None
+                retrieval_block = self._retrieval_system_block(user_message, exclude_id) or None
+
+            effective_appendix = system_appendix
+            if periodic_wake:
+                extra = PERIODIC_WAKE_SYSTEM_APPENDIX.strip()
+                if effective_appendix and effective_appendix.strip():
+                    effective_appendix = f"{effective_appendix.strip()}\n\n{extra}"
+                else:
+                    effective_appendix = extra
             try:
                 if announce:
                     await self._print_status("Agent running…")
                 result = await self._assistant.run_async(
                     user_message,
                     recursion_limit=self._recursion_limit,
-                    system_appendix=system_appendix,
+                    system_appendix=effective_appendix,
+                    prior_messages=prior_lc if interaction_turn else None,
+                    retrieval_system_block=retrieval_block,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.exception("Agent run failed")
@@ -430,6 +615,8 @@ class BoyoClawRuntime:
 
             if not self._delivery.reply_via_tool:
                 fallback = _extract_assistant_text(result)
+                if periodic_wake and _periodic_output_suppressed(fallback):
+                    return True
                 if fallback:
                     self.inbox.add_assistant(fallback)
                     cid = self._pending_telegram_chat_id
@@ -441,7 +628,7 @@ class BoyoClawRuntime:
 
     async def _maybe_wake_for_pending_todos(self) -> None:
         """If TODOS.md has real open work and the set changed since last todo-Wake, run Wake Up once."""
-        todos_path = self.sandbox_root / "TODOS.md"
+        todos_path = self.agent_home / "TODOS.md"
         if not has_non_placeholder_pending_todos(todos_path):
             return
         fp = non_placeholder_open_todos_fingerprint(todos_path)
@@ -496,14 +683,14 @@ class BoyoClawRuntime:
 
     def _sync_todos_wake_file_prep(self) -> None:
         """Remove completed lines, ensure default wake todo lines exist, MEMORY placeholder — run before every Wake Up."""
-        todos_path = self.sandbox_root / "TODOS.md"
+        todos_path = self.agent_home / "TODOS.md"
         clear_completed_todos(todos_path)
         prepend_wake_todos(todos_path)
-        ensure_memory_placeholder(self.sandbox_root / "MEMORY.md")
+        ensure_memory_placeholder(self.agent_home / "MEMORY.md")
 
     async def _wake_maintenance(self) -> tuple[bool, Path]:
         """Clear completed todos, prepend default wake todos, ensure MEMORY. Returns (should_run_wake_agent, todos_path)."""
-        todos_path = self.sandbox_root / "TODOS.md"
+        todos_path = self.agent_home / "TODOS.md"
         self._sync_todos_wake_file_prep()
         should_run = self.inbox.has_unread_human() or has_non_placeholder_pending_todos(
             todos_path,
@@ -545,12 +732,35 @@ class BoyoClawRuntime:
             if ok:
                 delete_wake(self.sandbox_root, rec["id"])
 
+    async def _periodic_three_hour_wake(self) -> None:
+        """Timer wake: quick todo pass; user-visible output only via send_message or SILENT."""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=PERIODIC_WAKE_INTERVAL_SEC)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if self._shutdown.is_set():
+                return
+            msg = (
+                "Wake Up\n\n"
+                "[Periodic wake — quick TODOS.md check; notify user only if necessary. "
+                "Otherwise end with SILENT.]"
+            )
+            await self._run_agent_turn(
+                msg,
+                announce=False,
+                interaction_turn=False,
+                periodic_wake=True,
+            )
+
     async def run_forever(self, *, enable_telegram: bool = False, headless: bool = False) -> None:
         self._loop = asyncio.get_running_loop()
         self._agent_turn_lock = asyncio.Lock()
 
         await self._print_status(
-            "[bold]BoyoClaw[/bold] — workspace: %s" % self.sandbox_root,
+            "[bold]BoyoClaw[/bold] — agent workspace: %s [dim](system root: %s)[/dim]"
+            % (self.agent_home, self.sandbox_root),
         )
         if headless:
             await self._print_status(
@@ -600,9 +810,13 @@ class BoyoClawRuntime:
                     tg_task = asyncio.create_task(_telegram_guard())
 
         sched_task = asyncio.create_task(self._scheduled_wake_scheduler())
-        extras: list[asyncio.Task[Any]] = [sched_task]
+        periodic_task = asyncio.create_task(self._periodic_three_hour_wake())
+        extras: list[asyncio.Task[Any]] = [sched_task, periodic_task]
         if tg_task is not None:
             extras.append(tg_task)
+        await self._print_status(
+            f"[dim]Periodic wake every {PERIODIC_WAKE_INTERVAL_SEC // 3600}h (first after one full interval).[/dim]",
+        )
 
         if headless:
             await asyncio.gather(

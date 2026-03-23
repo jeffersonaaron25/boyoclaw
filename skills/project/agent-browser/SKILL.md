@@ -45,7 +45,7 @@ Replace `YOUR_QUERY_HERE` with a URL-encoded query or use quotes and let the she
 
 - Prefer **quoting titles and URLs** from the snapshot or `agent-browser get url` / link targets you clicked through to.
 - If the page is noisy, scope with `agent-browser snapshot -s "#main"` or similar CSS (when you know the layout).
-- For **long articles**, paginate mentally: snapshot first, then `get text` on the article container ref if visible.
+- For **long articles**, paginate mentally: snapshot first, then `get text` on the main article element ref if visible.
 
 ### Stability
 

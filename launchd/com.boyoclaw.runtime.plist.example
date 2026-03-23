@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  BoyoClaw / MyClaw — LaunchAgent (user session)
+  BoyoClaw — LaunchAgent (user session)
 
   1. Copy to ~/Library/LaunchAgents/com.boyoclaw.runtime.plist
   2. Edit REPO_ROOT and PYTHON_BIN to your machine (absolute paths only).

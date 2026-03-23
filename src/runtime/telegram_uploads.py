@@ -22,12 +22,12 @@ def _safe_filename(name: str | None, fallback: str) -> str:
 async def download_telegram_file(
     bot: object,
     *,
-    sandbox_root: Path,
+    agent_home: Path,
     file_id: str,
     suggested_name: str,
 ) -> str:
-    """Download a Telegram file into ``sandbox_root``. Returns a workspace-relative POSIX path."""
-    root = Path(sandbox_root).resolve()
+    """Download a Telegram file into the agent workspace (``.agent-home``). Returns a path relative to that root."""
+    root = Path(agent_home).resolve()
     day = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     dest_dir = root / UPLOAD_SUBDIR / day
     dest_dir.mkdir(parents=True, exist_ok=True)

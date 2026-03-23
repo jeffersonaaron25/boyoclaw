@@ -18,13 +18,13 @@ Note: Built and tested only on MacOS.
 
 | Area | Behavior |
 |------|----------|
-| **Agent** | [`deepagents`](https://github.com/langchain-ai/deepagents) graph: skills, filesystem tools, shell `execute` (host by default). |
+| **Agent** | [`deepagents`](https://github.com/langchain-ai/deepagents) graph: skills, filesystem tools, shell `execute` (Docker by default in this runtime; host fallback when Docker is unavailable). |
 | **Workspace** | `.sandbox/workspace/` under the repo — synced bundled skills, `TODOS.md`, `MEMORY.md`, inbox data, Telegram uploads. |
 | **Runtime UI** | Async worker + Rich: status lines, `›` prompt for local input, Assistant panels for terminal-originated replies. |
 | **Telegram** (`--telegram`) | Long-polling bot; authorized chat IDs only; replies and optional file send; uploads land under `telegram_uploads/` (date-stamped subfolders). |
-| **Inbox tools** | `fetch_unread_messages`, `read_recent_messages`, `search_messages` (needs FAISS + Ollama embedder), `reply_to_human`; with Telegram: `send_file_to_user`. |
+| **Inbox tools** | `fetch_unread_messages`, `read_recent_messages`, `search_messages` (needs FAISS + Ollama embedder), `send_message`; with Telegram: `send_file_to_user`. |
 | **Wake / sleep** | Control messages `Wake Up` / `Go to Sleep` (not stored as normal user mail); wake maintenance prepends default lines in `TODOS.md`. |
-| **Docker (optional)** | `SandboxedAssistant(..., prefer_docker_isolation=True)` uses one persistent container per workspace (`docker exec`), `--network none` inside the container. Default is **host shell** so browsers and network CLIs work. |
+| **Docker (optional)** | `SandboxedAssistant(..., prefer_docker_isolation=True)` uses a persistent container per workspace (`docker exec`). The **user-facing** tree stays at `.sandbox/workspace/.agent-home/` on the host; the shell uses a **separate inner copy** at `/mnt/workspace/.agent-home` (Docker volume), merged with the host tree by mtime (and delete tracking via `.sandbox/workspace/.agent-home-sync-state.json`) at backend init and after each agent turn completes, not on every `execute`. Disable sync with `BOYOCLAW_AGENT_HOME_SYNC=0` if needed. `BOYOCLAW_DOCKER_NETWORK` defaults to **bridge**. **Audio sidecar** defaults to image tag `boyoclaw-audio:local` (unset `BOYOCLAW_AUDIO_DOCKER_IMAGE`); Kokoro/STT commands are routed there automatically (`BOYOCLAW_AUDIO_AUTO_ROUTE`, default on). Optional explicit prefix `###boyoclaw-audio###`. On **macOS**, `osascript` / `shortcuts` run on the **host** automatically. Set `BOYOCLAW_AUDIO_DOCKER_IMAGE=` empty to disable the sidecar. Default is **host shell**. |
 
 ---
 
@@ -38,6 +38,7 @@ Optional:
 
 - **`faiss-cpu`** + **`numpy`** — FAISS vector index for `search_messages`.
 - **Docker** — only if you enable Docker-isolated `execute`.
+- **Audio (Kokoro TTS + faster-whisper)** — models via `skills/project/kokoro-tts-telegram/scripts/setup_audio_models.sh` into `.agent-home/`. With Docker isolation, build `boyoclaw-audio:local` (default sidecar image); routing is automatic. Set `BOYOCLAW_AUDIO_DOCKER_IMAGE=` empty to disable the sidecar. Skills: `kokoro-tts-telegram`, `audio-stt-faster-whisper`.
 
 ---
 
@@ -146,8 +147,8 @@ python -m runtime --telegram
 ```
 
 - Same terminal prompt for local messages.
-- Telegram messages are queued the same way; `reply_to_human` is delivered to the chat that messaged (authorized ids only).
-- File uploads from Telegram are stored under `telegram_uploads/` and merged into the **next text message** for that chat.
+- Telegram messages are queued the same way; `send_message` is delivered to the chat that messaged (authorized ids only).
+- File uploads from Telegram are stored under `telegram_uploads/`; documents/photos/video/audio/animation are merged into the **next text message** for that chat, while **voice uploads** trigger the agent immediately.
 
 ### macOS `launchd` (background Telegram bot)
 

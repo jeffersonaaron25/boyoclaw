@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+import time
 from typing import Annotated, Any
 
 from langchain_core.tools import tool
@@ -24,7 +25,7 @@ def build_inbox_tools(
     telegram_file_try_send: TelegramFileTrySend | None = None,
     current_telegram_chat_id: Callable[[], int | None] | None = None,
 ) -> list:
-    """Inbox search/fetch plus acknowledge and reply_to_human for Rich CLI delivery."""
+    """Inbox search/fetch plus acknowledge and send_message for Rich CLI delivery."""
 
     @tool
     def fetch_unread_messages(
@@ -90,10 +91,36 @@ def build_inbox_tools(
         return body
 
     @tool
-    def reply_to_human(
-        message: Annotated[str, "Final complete answer delivered to the user and stored in the inbox."],
+    def send_message(
+        message: Annotated[str, "Message to send to the user."],
     ) -> str:
-        """Send the final response to the user. Prefer one clear acknowlegement and final reply per user message."""
+        """Send a response to the user.
+
+        For interactive turns that use a skill/long-running work, send one short acknowledgement first,
+        then send one final reply when done.
+        """
+        # Remove Markdown formatting: asterisks, underscores, backticks, and tildes only when used in Markdown constructs—not inside words or numbers.
+        import re
+        def _remove_markdown_formatting(msg: str) -> str:
+            # Remove **bold**, *italic*, __under__, _under_, ***word***, ~~strike~~, and `inline code`.
+            # Handles multi-line, block, and leading list/heading markdown (e.g. "- **foo**").
+            # Remove list/heading markdown tokens at line start
+            msg = re.sub(r'^[\s>*-]+', '', msg, flags=re.MULTILINE)
+            # Remove bold/italic/underline combos: ***, ___, **, __, *, _
+            msg = re.sub(r'(\*\*\*|___)(.*?)\1', r'\2', msg, flags=re.DOTALL)
+            msg = re.sub(r'(\*\*|__)(.*?)\1', r'\2', msg, flags=re.DOTALL)
+            msg = re.sub(r'(\*|_)(.*?)\1', r'\2', msg, flags=re.DOTALL)
+            # Inline code: `code`
+            msg = re.sub(r'`([^`]*)`', r'\1', msg)
+            # Strikethrough: ~~strike~~
+            msg = re.sub(r'~~([^~]*)~~', r'\1', msg)
+            # Remove bold/italic applied only to part of line (catch leftovers)
+            msg = re.sub(r'(\*{1,3}|_{1,3})(\S.*?)\1', r'\2', msg)
+            # Remove excess whitespace, leading/trailing spacing
+            msg = re.sub(r' +', ' ', msg)
+            return msg.strip()
+
+        message = _remove_markdown_formatting(message)
         inbox.add_assistant(message)
         if delivery is not None:
             delivery.reply_via_tool = True
@@ -101,12 +128,21 @@ def build_inbox_tools(
             on_reply(message)
         return "Reply delivered to the user and saved to the inbox."
 
+    @tool
+    def wait(
+        seconds: Annotated[int, "Number of seconds to wait before continuing."],
+    ) -> str:
+        """Wait for a specified number of seconds before continuing."""
+        time.sleep(seconds)
+        return f"Waited for {seconds} seconds."
+
     tools: list = [
         fetch_unread_messages,
         read_recent_messages,
         search_messages,
         schedule_wake,
-        reply_to_human,
+        send_message,
+        wait,
     ]
 
     if telegram_file_try_send is not None:
@@ -125,7 +161,7 @@ def build_inbox_tools(
             """Send a file from the workspace to the user via Telegram (same chat they wrote from).
 
             Use when the user asked for a document, export, or artifact and they are on Telegram.
-            For terminal-only sessions this will not deliver a file—use reply_to_human with the path instead.
+            For terminal-only sessions this will not deliver a file—use send_message with the path instead.
             Telegram bot uploads are limited in size (order of tens of MB).
             """
             _ok, msg = telegram_file_try_send(workspace_relative_path.strip(), caption.strip())

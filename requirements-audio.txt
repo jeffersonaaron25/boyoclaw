@@ -1,0 +1,4 @@
+# Optional: Kokoro TTS CLI + faster-whisper (skills under skills/project/*/scripts/ and docker/boyoclaw-audio.Dockerfile).
+# Python 3.9–3.12 per kokoro-tts; keep in sync with the sandbox image (3.12).
+kokoro-tts>=2.3.0,<3
+faster-whisper>=1.0.0,<2

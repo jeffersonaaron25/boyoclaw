@@ -141,7 +141,7 @@ def ensure_memory_placeholder(memory_path: Path) -> None:
         return
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     memory_path.write_text(
-        "# MEMORY\n\n[Format: <Date>] <Type: Experience|Thought|Learning>:<Content>\n",
+        "# MEMORY\n\n[Format: <Date in YYYY-MM-DD>] <Type: Experience|Thought|Learning>:<Content>\n",
         encoding="utf-8",
     )
 

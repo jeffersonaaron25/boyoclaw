@@ -129,12 +129,43 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
             "BoyoClaw Telegram is linked to your workspace.\n"
             "• Send text to run the agent.\n"
             "• You can upload files first (documents, photos, video, audio, voice); they are saved under "
-            "`telegram_uploads/` and picked up on your **next text message**—uploads alone do not start the agent.\n"
+            "`telegram_uploads/` and picked up on your **next text message**.\n"
+            "• Voice uploads start the agent immediately (no extra text needed).\n"
+            "• /agent_pause — stop all agent wakes and replies (listener stays on). "
+            "/agent_resume — resume.\n"
             "Use /help for this message.",
         )
 
     async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await cmd_start(update, context)
+
+    async def cmd_agent_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None or update.message is None:
+            return
+        cid = update.effective_chat.id
+        if cid not in settings.allowed_chat_ids:
+            await update.message.reply_text("Not authorized.")
+            return
+        if runtime.agent_paused():
+            await update.message.reply_text("Agent is already paused.")
+            return
+        runtime.set_agent_paused(True)
+        await update.message.reply_text(
+            "Agent paused. No wakes or agent responses until you send /agent_resume.",
+        )
+
+    async def cmd_agent_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None or update.message is None:
+            return
+        cid = update.effective_chat.id
+        if cid not in settings.allowed_chat_ids:
+            await update.message.reply_text("Not authorized.")
+            return
+        if not runtime.agent_paused():
+            await update.message.reply_text("Agent was not paused.")
+            return
+        runtime.set_agent_paused(False)
+        await update.message.reply_text("Agent resumed. You can send messages again.")
 
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat is None or update.message is None:
@@ -147,6 +178,11 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
             await update.message.reply_text("Not authorized.")
             return
         msg_stripped = msg.strip()
+        if runtime.agent_paused():
+            await update.message.reply_text(
+                "Agent is paused. Send /agent_resume or /agent-resume to continue.",
+            )
+            return
         paths, caption_prefix = runtime.pop_telegram_pending_uploads(cid)
         body = caption_prefix + msg_stripped
         await runtime.enqueue_turn(
@@ -164,6 +200,8 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
         *,
         file_id: str,
         suggested_name: str,
+        auto_enqueue_text: str | None = None,
+        notify_saved: bool = True,
     ) -> None:
         msg = update.message
         if msg is None or update.effective_chat is None:
@@ -176,7 +214,7 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
         try:
             rel = await download_telegram_file(
                 context.bot,
-                sandbox_root=runtime.sandbox_root,
+                agent_home=runtime.agent_home,
                 file_id=file_id,
                 suggested_name=suggested_name,
             )
@@ -193,11 +231,29 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
             await msg.reply_text(f"Could not save file: {e}")
             return
 
+        if auto_enqueue_text is not None:
+            if runtime.agent_paused():
+                await msg.reply_text(
+                    "Agent is paused. Send /agent_resume or /agent-resume to continue.",
+                )
+                return
+            body = caption if caption else auto_enqueue_text
+            await runtime.enqueue_turn(
+                QueuedTurn(
+                    text=body,
+                    telegram_chat_id=cid,
+                    uploaded_workspace_paths=(rel,),
+                    telegram_sender_label=format_telegram_sender_label(update),
+                ),
+            )
+            return
+
         runtime.record_telegram_pending_upload(cid, rel, caption)
-        await msg.reply_text(
-            f"Saved to workspace: {rel}\n"
-            "Send a text message when you want the agent to use it."
-        )
+        if notify_saved:
+            await msg.reply_text(
+                f"Saved to agent workspace: {rel}\n"
+                "Send a text message when you want the agent to use it."
+            )
 
     async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -234,7 +290,14 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
         msg = update.message
         if msg is None or msg.voice is None:
             return
-        await _save_upload_pending(update, context, file_id=msg.voice.file_id, suggested_name="voice.ogg")
+        await _save_upload_pending(
+            update,
+            context,
+            file_id=msg.voice.file_id,
+            suggested_name="voice.ogg",
+            auto_enqueue_text="The user sent a Telegram voice message. Transcribe it and respond to the user.",
+            notify_saved=False,
+        )
 
     async def on_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -249,6 +312,14 @@ async def run_telegram_polling(runtime: object, settings: TelegramSettings) -> N
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("agent_pause", cmd_agent_pause))
+    application.add_handler(CommandHandler("agent_resume", cmd_agent_resume))
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^/agent-pause$"), cmd_agent_pause),
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^/agent-resume$"), cmd_agent_resume),
+    )
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(MessageHandler(filters.VIDEO, on_video))

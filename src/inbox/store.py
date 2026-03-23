@@ -1,4 +1,9 @@
-"""SQLite inbox + FAISS vector index (Ollama nomic-embed-text + faiss-cpu)."""
+"""SQLite inbox + FAISS vector index (Ollama embeddings + faiss-cpu).
+
+Corpus vectors use ``embed_documents``; search uses ``embed_query`` (LangChain's
+retrieval split). For Nomic models, ``search_document:`` / ``search_query:``
+prefixes are applied. Vectors are L2-normalized; ``IndexFlatIP`` is cosine similarity.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,10 @@ from typing import Any, Literal
 logger = logging.getLogger(__name__)
 
 MessageType = Literal["human", "assistant"]
+
+# Persisted index files (v2: embed_query for queries + Nomic prefixes when applicable).
+_FAISS_INDEX_NAME = "faiss_l2ip_v2.index"
+_FAISS_IDS_NAME = "faiss_l2ip_v2_ids.json"
 
 try:
     import faiss  # type: ignore[import-untyped]
@@ -62,8 +71,8 @@ class MessageInbox:
         self._ollama_base_url = ollama_base_url
         self._embeddings: Any = None
         self.db_path = self.base_dir / "messages.sqlite"
-        self._index_path = self.base_dir / "faiss.index"
-        self._ids_path = self.base_dir / "faiss_ids.json"
+        self._index_path = self.base_dir / _FAISS_INDEX_NAME
+        self._ids_path = self.base_dir / _FAISS_IDS_NAME
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
@@ -102,18 +111,46 @@ class MessageInbox:
             self._embeddings = OllamaEmbeddings(**kwargs)
         return self._embeddings
 
-    def _encode(self, texts: list[str]) -> Any:
+    def _use_nomic_asymmetric_prefixes(self) -> bool:
+        """Nomic models are trained with search_query vs search_document prefixes for retrieval."""
+        return "nomic" in self._ollama_model.casefold()
+
+    def _text_for_document_embedding(self, raw: str) -> str:
+        if self._use_nomic_asymmetric_prefixes():
+            return f"search_document: {raw}"
+        return raw
+
+    def _text_for_query_embedding(self, raw: str) -> str:
+        s = raw.strip() if raw else ""
+        if not s:
+            s = " "
+        if self._use_nomic_asymmetric_prefixes():
+            return f"search_query: {s}"
+        return s
+
+    def _encode_documents(self, texts: list[str]) -> Any:
+        """Batch embeddings for stored messages (corpus side of retrieval)."""
         if np is None:
             raise RuntimeError("numpy required for FAISS")
-        emb = self._lazy_embeddings().embed_documents(texts)
+        prepared = [self._text_for_document_embedding(t) for t in texts]
+        emb = self._lazy_embeddings().embed_documents(prepared)
         arr = np.array(emb, dtype=np.float32)
+        return _l2_normalize_rows(arr)
+
+    def _encode_query_vector(self, query: str) -> Any:
+        """Single query vector for search — uses ``embed_query`` (LangChain retrieval convention)."""
+        if np is None:
+            raise RuntimeError("numpy required for FAISS")
+        text = self._text_for_query_embedding(query)
+        emb = self._lazy_embeddings().embed_query(text)
+        arr = np.array([emb], dtype=np.float32)
         return _l2_normalize_rows(arr)
 
     def _embedding_dim(self) -> int:
         """Dimension of the active Ollama embedding model (probe once)."""
         if self._dim is not None:
             return self._dim
-        v = self._encode(["."])
+        v = self._encode_documents(["."])
         self._dim = int(v.shape[1])
         return self._dim
 
@@ -140,7 +177,7 @@ class MessageInbox:
                     self._rebuild_index()
                     return
                 try:
-                    probe_dim = self._encode(["probe"]).shape[1]
+                    probe_dim = self._encode_documents(["probe"]).shape[1]
                     if probe_dim != self._index.d:
                         logger.warning(
                             "Embedding dimension changed (%s vs %s); rebuilding FAISS index.",
@@ -177,7 +214,7 @@ class MessageInbox:
 
         texts = [str(r[1]) for r in rows]
         try:
-            emb = self._encode(texts)
+            emb = self._encode_documents(texts)
         except RuntimeError as e:
             logger.warning("Embedding failed (%s); vector index disabled.", e)
             self._index = None
@@ -225,7 +262,7 @@ class MessageInbox:
         if not _HAS_FAISS or faiss is None or self._index is None:
             return
         try:
-            emb = self._encode([content])
+            emb = self._encode_documents([content])
             self._index.add(emb)
             self._faiss_ids.append(mid)
             self._persist_index()
@@ -267,11 +304,48 @@ class MessageInbox:
             self._conn.commit()
         return out
 
-    def fetch_recent_messages(self, *, limit: int = 5) -> list[dict[str, Any]]:
+    def fetch_messages_before_newest(self, *, count: int = 3) -> list[dict[str, Any]]:
+        """The ``count`` messages strictly before the newest row (by ``created_at``). Oldest-first.
+
+        Used to prepend recent history **excluding** the current user message (which is already the newest row).
+        """
+        count = max(1, min(count, 50))
+        rows = self._conn.execute(
+            """
+            SELECT id, created_at, type, content, is_read
+            FROM messages
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (count + 1,),
+        ).fetchall()
+        if len(rows) <= 1:
+            return []
+        prior = list(rows[1 : 1 + count])
+        prior.reverse()
+        return [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"],
+                "type": r["type"],
+                "content": r["content"],
+                "is_read": bool(r["is_read"]),
+            }
+            for r in prior
+        ]
+
+    def fetch_recent_messages(
+        self,
+        *,
+        limit: int = 5,
+        mark_read_in_window: bool = True,
+    ) -> list[dict[str, Any]]:
         """Return the latest ``limit`` rows (human and assistant), oldest-first.
 
-        Any **human** message in this slice that was unread is marked read (does not affect
-        other unread rows outside the window). Separate from :meth:`fetch_unread_human`.
+        Any **human** message in this slice that was unread is marked read when
+        ``mark_read_in_window`` is true (does not affect other unread rows outside the window).
+        Set to false when loading context for the model without affecting unread state.
+        Separate from :meth:`fetch_unread_human`.
         """
         limit = max(1, min(limit, 50))
         rows = list(
@@ -302,7 +376,7 @@ class MessageInbox:
                 },
             )
 
-        if unread_human_ids:
+        if mark_read_in_window and unread_human_ids:
             self._conn.executemany(
                 "UPDATE messages SET is_read = 1 WHERE id = ?",
                 [(i,) for i in unread_human_ids],
@@ -324,7 +398,7 @@ class MessageInbox:
             and self._index.ntotal > 0
         ):
             try:
-                q = self._encode([query])
+                q = self._encode_query_vector(query)
                 scores, indices = self._index.search(q, min(limit, self._index.ntotal))
                 results: list[dict[str, Any]] = []
                 for score, idx in zip(scores[0], indices[0]):
