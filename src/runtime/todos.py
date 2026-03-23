@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -84,6 +85,31 @@ def has_non_placeholder_pending_todos(todos_path: Path) -> bool:
         if not key or key not in _WAKE_PLACEHOLDER_KEYS:
             return True
     return False
+
+
+def non_placeholder_open_todos_fingerprint(todos_path: Path) -> str:
+    """SHA-256 of sorted open non-placeholder todo title keys — for wake deduplication.
+
+    Same todo set → same fingerprint. When the set changes (complete/add/edit open item),
+    the fingerprint changes so a new Wake is allowed.
+    """
+    todos_path = Path(todos_path)
+    if not todos_path.is_file():
+        return ""
+    keys: list[str] = []
+    for line in todos_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not _OPEN_TODO.match(stripped):
+            continue
+        key = _todo_title_key(line)
+        if not key or key in _WAKE_PLACEHOLDER_KEYS:
+            continue
+        keys.append(key)
+    keys.sort()
+    if not keys:
+        return ""
+    payload = "\n".join(keys).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def prepend_wake_todos(todos_path: Path) -> None:

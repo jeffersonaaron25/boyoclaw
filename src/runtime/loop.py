@@ -19,13 +19,28 @@ from runtime.todos import (
     clear_completed_todos,
     ensure_memory_placeholder,
     has_non_placeholder_pending_todos,
+    non_placeholder_open_todos_fingerprint,
     prepend_wake_todos,
 )
 from runtime.turn import QueuedTurn
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+
+def _user_message_is_wake_up(user_message: str) -> bool:
+    """True when this turn is a Wake Up run (internal or user-typed), including Wake + Telegram upload suffix."""
+    s = user_message.strip()
+    if not s:
+        return False
+    first = s.split("\n", 1)[0].strip()
+    norm = " ".join(first.split()).casefold()
+    return norm == "wake up"
+
+
 MYCLAW_RUNTIME_PROMPT = """
+Current date and time: {current_date_time}
+
 ## BoyoClaw interaction rules
 - Interactive terminal: the user already sees what they typed. Answer that line directly in a natural chat tone.
   Do not describe their lines as "unread inbox messages" or re-list them as mail unless they explicitly ask about the inbox.
@@ -33,6 +48,7 @@ MYCLAW_RUNTIME_PROMPT = """
 - Use `search_messages` when you need to recall past conversation or facts (e.g. a name they mentioned before). You must use this 
   if user is following up on a previous conversation or fact and you have some context to search for.
 - Use `read_recent_messages` to get the context of the recent conversation when you have no idea what the user is referring to.
+- Use `schedule_wake` when the user wants a **future** reminder: pass an ISO 8601 time **in the future** and a short **context** explaining why. The runtime fires a normal Wake at that time with that context - so ensure you have sufficient context to perform the task.
 
 ## Default wake TODOs — never user-facing
 `TODOS.md` is auto-prepended with three **system** lines (same idea every run): see unread / acknowledge / update TODOS.md.
@@ -63,6 +79,9 @@ These are **runtime housekeeping**, not the user's personal task list.
 - If you see a **size warning** above the MEMORY block, prioritize **rewriting `MEMORY.md` into a compact form** (essential facts only, compact notation) when you touch that file.
 - If user asks you to do routine tasks, you must add to memory and ensure you add them to your TODOS.md and execute them at the interval of user choice. Ensure you get the relevant information from user before adding to memory.
 - Save user preferences, your learnings and experiences in MEMORY.md if it is relevant to your long term memory.
+- Proactively store memory when appropriate, and ensure it is compact and relevant to what you need to remember long term.
+- You can store user preferences (what they like, what they dislike, what they are interested in, what they are not interested in, etc.), your learnings (what you have learned from the user, what you have learned from the user's preferences, etc.), and your experiences (what you have experienced, what you have learned from the user's preferences, etc.) in MEMORY.md if it is relevant to your long term memory.
+- Model your personality and behavior based on memory.
 
 ## Workspace hygiene
 - Keep the sandbox lean: remove **scratch**, **temporary**, and **duplicate** outputs you no longer need (old exports, repeated downloads, abandoned build dirs) once a task is done or superseded.
@@ -123,6 +142,8 @@ class BoyoClawRuntime:
         self._pending_telegram_chat_id: int | None = None
         # Telegram: file-only messages save here until the user sends a text line (same chat).
         self._telegram_pending_uploads: dict[int, list[tuple[str, str]]] = {}
+        # After a Wake driven by non-placeholder todos, same todo set → same fingerprint → no repeat Wake.
+        self._last_todo_wake_fingerprint: str = ""
 
         self.inbox = MessageInbox(
             self.sandbox_root / "inbox",
@@ -132,15 +153,17 @@ class BoyoClawRuntime:
 
         combined = (system_prompt or "").strip()
         if combined:
-            combined = combined + "\n\n" + MYCLAW_RUNTIME_PROMPT
+            combined = combined + "\n\n" + MYCLAW_RUNTIME_PROMPT.format(current_date_time=datetime.now().isoformat())
         else:
             combined = MYCLAW_RUNTIME_PROMPT.strip()
 
         tools = build_inbox_tools(
             self.inbox,
+            sandbox_root=self.sandbox_root,
             on_reply=self._sync_reply_ui,
             delivery=self._delivery,
             telegram_file_try_send=self._try_schedule_telegram_file,
+            current_telegram_chat_id=lambda: self._pending_telegram_chat_id,
         )
         self._assistant = SandboxedAssistant(
             sandbox_root=self.sandbox_root,
@@ -385,39 +408,62 @@ class BoyoClawRuntime:
         *,
         announce: bool = True,
         system_appendix: str | None = None,
-    ) -> None:
-        if self._assistant is None:
-            return
-        self._delivery.reply_via_tool = False
-        try:
-            if announce:
-                await self._print_status("Agent running…")
-            result = await self._assistant.run_async(
-                user_message,
-                recursion_limit=self._recursion_limit,
-                system_appendix=system_appendix,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Agent run failed")
-            await self._agent_error_user_visible(f"Error: {e}")
-            return
+    ) -> bool:
+        async with self._agent_turn_lock:
+            if self._assistant is None:
+                return False
+            if _user_message_is_wake_up(user_message):
+                self._sync_todos_wake_file_prep()
+            self._delivery.reply_via_tool = False
+            try:
+                if announce:
+                    await self._print_status("Agent running…")
+                result = await self._assistant.run_async(
+                    user_message,
+                    recursion_limit=self._recursion_limit,
+                    system_appendix=system_appendix,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Agent run failed")
+                await self._agent_error_user_visible(f"Error: {e}")
+                return False
 
-        if not self._delivery.reply_via_tool:
-            fallback = _extract_assistant_text(result)
-            if fallback:
-                self.inbox.add_assistant(fallback)
-                cid = self._pending_telegram_chat_id
-                if cid is not None:
-                    await self._telegram_send_text(cid, fallback)
-                else:
-                    await self._async_print_reply(fallback)
+            if not self._delivery.reply_via_tool:
+                fallback = _extract_assistant_text(result)
+                if fallback:
+                    self.inbox.add_assistant(fallback)
+                    cid = self._pending_telegram_chat_id
+                    if cid is not None:
+                        await self._telegram_send_text(cid, fallback)
+                    else:
+                        await self._async_print_reply(fallback)
+            return True
+
+    async def _maybe_wake_for_pending_todos(self) -> None:
+        """If TODOS.md has real open work and the set changed since last todo-Wake, run Wake Up once."""
+        todos_path = self.sandbox_root / "TODOS.md"
+        if not has_non_placeholder_pending_todos(todos_path):
+            return
+        fp = non_placeholder_open_todos_fingerprint(todos_path)
+        if not fp or fp == self._last_todo_wake_fingerprint:
+            return
+        ok = await self._run_agent_turn("Wake Up", announce=True)
+        if ok:
+            self._last_todo_wake_fingerprint = non_placeholder_open_todos_fingerprint(todos_path)
 
     async def _agent_worker(self) -> None:
+        # When idle, avoid hammering TODOS.md on every short queue timeout.
+        idle_polls_before_todo_check = 0
         while not self._shutdown.is_set():
             try:
                 line = await asyncio.wait_for(self._human_queue.get(), timeout=0.35)
             except asyncio.TimeoutError:
+                idle_polls_before_todo_check += 1
+                if idle_polls_before_todo_check >= 15:
+                    idle_polls_before_todo_check = 0
+                    await self._maybe_wake_for_pending_todos()
                 continue
+            idle_polls_before_todo_check = 0
             await self._process_one(line)
 
     async def _input_loop(self) -> None:
@@ -448,12 +494,17 @@ class BoyoClawRuntime:
                 break
             await self._human_queue.put(QueuedTurn(text=line.rstrip("\n\r")))
 
-    async def _wake_maintenance(self) -> tuple[bool, Path]:
-        """Clear completed todos, prepend default wake todos, ensure MEMORY. Returns (should_run_wake_agent, todos_path)."""
+    def _sync_todos_wake_file_prep(self) -> None:
+        """Remove completed lines, ensure default wake todo lines exist, MEMORY placeholder — run before every Wake Up."""
         todos_path = self.sandbox_root / "TODOS.md"
         clear_completed_todos(todos_path)
         prepend_wake_todos(todos_path)
         ensure_memory_placeholder(self.sandbox_root / "MEMORY.md")
+
+    async def _wake_maintenance(self) -> tuple[bool, Path]:
+        """Clear completed todos, prepend default wake todos, ensure MEMORY. Returns (should_run_wake_agent, todos_path)."""
+        todos_path = self.sandbox_root / "TODOS.md"
+        self._sync_todos_wake_file_prep()
         should_run = self.inbox.has_unread_human() or has_non_placeholder_pending_todos(
             todos_path,
         )
@@ -463,8 +514,40 @@ class BoyoClawRuntime:
         """Keep the process alive without reading stdin (launchd has no TTY)."""
         await self._shutdown.wait()
 
+    async def _scheduled_wake_scheduler(self) -> None:
+        """Fire due scheduled wakes (from ``schedule_wake`` tool); delete each record after a successful turn."""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=10.0)
+                return
+            except asyncio.TimeoutError:
+                await self._drain_due_scheduled_wakes()
+
+    async def _drain_due_scheduled_wakes(self) -> None:
+        from runtime.scheduled_wake import delete_wake, list_due_wakes
+
+        for rec in list_due_wakes(self.sandbox_root):
+            if self._shutdown.is_set():
+                return
+            msg = (
+                "Wake Up\n\n"
+                "[Scheduled wake — context saved when this alarm was set]\n"
+                f"{rec['context']}"
+            )
+            tc = rec.get("telegram_chat_id")
+            prev = self._pending_telegram_chat_id
+            if isinstance(tc, int):
+                self._pending_telegram_chat_id = tc
+            try:
+                ok = await self._run_agent_turn(msg, announce=True)
+            finally:
+                self._pending_telegram_chat_id = prev
+            if ok:
+                delete_wake(self.sandbox_root, rec["id"])
+
     async def run_forever(self, *, enable_telegram: bool = False, headless: bool = False) -> None:
         self._loop = asyncio.get_running_loop()
+        self._agent_turn_lock = asyncio.Lock()
 
         await self._print_status(
             "[bold]BoyoClaw[/bold] — workspace: %s" % self.sandbox_root,
@@ -474,7 +557,7 @@ class BoyoClawRuntime:
                 "[dim]Headless mode: no local stdin (Telegram or other queues only).[/dim]",
             )
 
-        should_wake, _todos = await self._wake_maintenance()
+        should_wake, todos_path = await self._wake_maintenance()
         if should_wake:
             await self._run_agent_turn("Wake Up")
         else:
@@ -482,6 +565,7 @@ class BoyoClawRuntime:
                 "[dim]Idle: no unread inbox messages and no open todos beyond the default "
                 "wake placeholders — Wake Up skipped; send a message to run the agent.[/dim]",
             )
+        self._last_todo_wake_fingerprint = non_placeholder_open_todos_fingerprint(todos_path)
 
         tg_task: asyncio.Task[None] | None = None
         if enable_telegram:
@@ -515,17 +599,22 @@ class BoyoClawRuntime:
                     )
                     tg_task = asyncio.create_task(_telegram_guard())
 
+        sched_task = asyncio.create_task(self._scheduled_wake_scheduler())
+        extras: list[asyncio.Task[Any]] = [sched_task]
+        if tg_task is not None:
+            extras.append(tg_task)
+
         if headless:
             await asyncio.gather(
                 self._headless_stdin_placeholder(),
                 self._agent_worker(),
-                *([] if tg_task is None else [tg_task]),
+                *extras,
             )
         else:
             await asyncio.gather(
                 self._input_loop(),
                 self._agent_worker(),
-                *([] if tg_task is None else [tg_task]),
+                *extras,
             )
 
 
@@ -541,7 +630,7 @@ async def async_main(*, enable_telegram: bool = False, headless: bool = False) -
     rt = BoyoClawRuntime(
         sandbox_root=project_root() / ".sandbox" / "workspace",
         model=model,
-        system_prompt="You are BoyoClaw, a capable agent. Follow the BoyoClaw interaction rules.",
+        system_prompt="You are BoyoClaw, a capable, autonomous, long running background agent. Follow the BoyoClaw interaction rules.",
     )
     await rt.run_forever(enable_telegram=enable_telegram, headless=headless)
 

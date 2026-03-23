@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Annotated, Any
 
 from langchain_core.tools import tool
@@ -17,9 +18,11 @@ TelegramFileTrySend = Callable[[str, str], tuple[bool, str]]
 def build_inbox_tools(
     inbox: MessageInbox,
     *,
+    sandbox_root: Path,
     on_reply: ReplyCallback | None = None,
     delivery: Any | None = None,
     telegram_file_try_send: TelegramFileTrySend | None = None,
+    current_telegram_chat_id: Callable[[], int | None] | None = None,
 ) -> list:
     """Inbox search/fetch plus acknowledge and reply_to_human for Rich CLI delivery."""
 
@@ -61,6 +64,32 @@ def build_inbox_tools(
         return json.dumps({"results": rows, "count": len(rows)}, indent=2)
 
     @tool
+    def schedule_wake(
+        when_iso: Annotated[
+            str,
+            "When to wake you: ISO 8601 datetime strictly in the future "
+            "(e.g. 2026-03-24T09:00:00-07:00 or 2026-03-24T16:00:00Z).",
+        ],
+        context: Annotated[
+            str,
+            "Why this wake exists; you will see it again when the alarm fires (keep it actionable).",
+        ],
+    ) -> str:
+        """Schedule a future Wake Up with saved context. The record is removed after that wake runs."""
+        from runtime.scheduled_wake import schedule_wake_add
+
+        tc = current_telegram_chat_id() if current_telegram_chat_id else None
+        ok, body = schedule_wake_add(
+            sandbox_root,
+            when_iso,
+            context,
+            telegram_chat_id=tc,
+        )
+        if not ok:
+            return body
+        return body
+
+    @tool
     def reply_to_human(
         message: Annotated[str, "Final complete answer delivered to the user and stored in the inbox."],
     ) -> str:
@@ -72,7 +101,13 @@ def build_inbox_tools(
             on_reply(message)
         return "Reply delivered to the user and saved to the inbox."
 
-    tools: list = [fetch_unread_messages, read_recent_messages, search_messages, reply_to_human]
+    tools: list = [
+        fetch_unread_messages,
+        read_recent_messages,
+        search_messages,
+        schedule_wake,
+        reply_to_human,
+    ]
 
     if telegram_file_try_send is not None:
 
