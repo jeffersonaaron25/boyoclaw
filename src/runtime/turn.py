@@ -14,3 +14,5 @@ class QueuedTurn:
     uploaded_workspace_paths: tuple[str, ...] = ()
     # Telegram display name / @username; injected as a per-turn system message, not into inbox text.
     telegram_sender_label: str | None = None
+    # SQLite id from :meth:`MessageInbox.add_human` (unread until the worker starts ``run_async``).
+    human_message_id: str | None = None

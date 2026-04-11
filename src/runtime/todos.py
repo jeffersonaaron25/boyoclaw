@@ -9,13 +9,16 @@ from pathlib import Path
 # Lines to prepend on wake / runtime start (dedupe by title key).
 WAKE_TODO_LINES: list[str] = [
     "[] See unread messages | Use fetch_unread_messages tool to fetch unread messages from the inbox. | High | todo | ASAP",
-    "[] Acknowledge unread messages | Use acknowledge(message: str) to acknowledge unread messages. | High | todo | ASAP",
+    "[] Acknowledge unread messages | Use send_message(message: str) to acknowledge unread messages. | High | todo | ASAP",
     "[] Update TODOS.md | Update TODOS.md with the new TODOs. | High | todo | ASAP",
 ]
 
 # Open todo: [] or [ ] at line start; completed: [x] / [X]
 _OPEN_TODO = re.compile(r"^\[\s*\]\s")
 _COMPLETED_TODO = re.compile(r"^\[[xX]\]\s*")
+# Model mistake: ``[] [x] Title`` — not matched by ``_COMPLETED_TODO`` alone; strip on wake.
+_MALFORMED_OPEN_THEN_DONE = re.compile(r"^\[\s*\]\s*\[[xX]\]\s")
+_JUNK_LINE = re.compile(r"^\s*ASAP\s*$", re.IGNORECASE)
 
 
 def _body_after_checkbox(line: str) -> str:
@@ -26,12 +29,28 @@ def _body_after_checkbox(line: str) -> str:
     return s[idx + 1 :].lstrip()
 
 
+def _body_after_leading_checkboxes(line: str) -> str:
+    """Strip one or more stacked ``[]`` / ``[x]`` prefixes (common edit mistake)."""
+    t = line.strip()
+    for _ in range(8):
+        if _COMPLETED_TODO.match(t):
+            t = _body_after_checkbox(t)
+            continue
+        if _OPEN_TODO.match(t):
+            t = _body_after_checkbox(t)
+            continue
+        break
+    return t
+
+
 def _todo_title_key(line: str) -> str:
     """Title key for dedupe; supports both open [] and completed [x] lines."""
     line = line.strip()
     if not (_COMPLETED_TODO.match(line) or _OPEN_TODO.match(line)):
         return ""
-    rest = _body_after_checkbox(line)
+    rest = _body_after_leading_checkboxes(line)
+    if not rest:
+        return ""
     if "|" not in rest:
         return rest[:80]
     return rest.split("|", 1)[0].strip()
@@ -43,22 +62,84 @@ _WAKE_PLACEHOLDER_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _is_malformed_completed_line(line: str) -> bool:
+    """``[] [x] …`` — completed but not matched by ``_is_completed_todo_line``."""
+    return bool(_MALFORMED_OPEN_THEN_DONE.match(line.strip()))
+
+
+def _is_junk_line(line: str) -> bool:
+    return bool(_JUNK_LINE.match(line))
+
+
+def _is_completed_todo_line(line: str) -> bool:
+    return bool(_COMPLETED_TODO.match(line.strip()))
+
+
+def _is_effective_open_todo_line(line: str) -> bool:
+    """True for incomplete ``[]`` lines; false for ``[] [x] …`` mistakes (treat as done/cruft)."""
+    s = line.strip()
+    if not _OPEN_TODO.match(s):
+        return False
+    return not _is_malformed_completed_line(line)
+
+
+def _dedupe_open_wake_placeholders(lines: list[str]) -> list[str]:
+    """Keep a single open line per default wake title key (drops duplicate template rows)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if not _OPEN_TODO.match(stripped):
+            out.append(ln)
+            continue
+        if not _is_effective_open_todo_line(ln):
+            out.append(ln)
+            continue
+        key = _todo_title_key(ln)
+        if key in _WAKE_PLACEHOLDER_KEYS:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(ln)
+    return out
+
+
+def _collapse_consecutive_blank_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    prev_blank = False
+    for ln in lines:
+        blank = not ln.strip()
+        if blank and prev_blank:
+            continue
+        out.append(ln)
+        prev_blank = blank
+    return out
+
+
 def clear_completed_todos(todos_path: Path) -> None:
     """Remove completed todo lines ([x] / [X]) from TODOS.md (SPEC: clear on wake)."""
     todos_path = Path(todos_path)
     if not todos_path.is_file():
         return
     lines = todos_path.read_text(encoding="utf-8").splitlines()
-    kept = [ln for ln in lines if not _is_completed_todo_line(ln)]
+    kept: list[str] = []
+    for ln in lines:
+        if _is_completed_todo_line(ln):
+            continue
+        if _is_malformed_completed_line(ln):
+            continue
+        if _is_junk_line(ln):
+            continue
+        kept.append(ln)
+    kept = _dedupe_open_wake_placeholders(kept)
+    kept = _collapse_consecutive_blank_lines(kept)
+    while kept and not kept[-1].strip():
+        kept.pop()
     text = "\n".join(kept)
     if text.strip():
         todos_path.write_text(text + "\n", encoding="utf-8")
     else:
         todos_path.write_text("", encoding="utf-8")
-
-
-def _is_completed_todo_line(line: str) -> bool:
-    return bool(_COMPLETED_TODO.match(line.strip()))
 
 
 def has_pending_todos(todos_path: Path) -> bool:
@@ -67,7 +148,7 @@ def has_pending_todos(todos_path: Path) -> bool:
     if not todos_path.is_file():
         return False
     for line in todos_path.read_text(encoding="utf-8").splitlines():
-        if _OPEN_TODO.match(line.strip()):
+        if _is_effective_open_todo_line(line):
             return True
     return False
 
@@ -78,8 +159,7 @@ def has_non_placeholder_pending_todos(todos_path: Path) -> bool:
     if not todos_path.is_file():
         return False
     for line in todos_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not _OPEN_TODO.match(stripped):
+        if not _is_effective_open_todo_line(line):
             continue
         key = _todo_title_key(line)
         if not key or key not in _WAKE_PLACEHOLDER_KEYS:
@@ -98,8 +178,7 @@ def non_placeholder_open_todos_fingerprint(todos_path: Path) -> str:
         return ""
     keys: list[str] = []
     for line in todos_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not _OPEN_TODO.match(stripped):
+        if not _is_effective_open_todo_line(line):
             continue
         key = _todo_title_key(line)
         if not key or key in _WAKE_PLACEHOLDER_KEYS:
@@ -172,7 +251,7 @@ def memory_system_prompt_appendix(memory_path: Path) -> str:
     approx = _approx_token_count_text(body)
 
     lines = [
-        "## MEMORY.md (workspace long-term memory, full contents below)",
+        "## MEMORY.md (your workspace long-term memory - full contents below)",
         "",
     ]
     if approx >= MEMORY_TOKEN_WARN_THRESHOLD:

@@ -72,7 +72,7 @@ Pull the embedding model (used by `MessageInbox` when FAISS is available):
 ollama pull nomic-embed-text
 ```
 
-Ensure your **chat** model is available in Ollama. The default entrypoint uses `ChatOllama(model="minimax-m2.7:cloud")` in `src/runtime/loop.py` — change that to your model if needed.
+Ensure your **chat** model is available in Ollama. The default entrypoint uses `ChatOllama(model="gemma4")` in `src/runtime/loop.py` — change that to your model if needed.
 
 ### 3. Run from the repo root
 

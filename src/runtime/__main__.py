@@ -6,10 +6,16 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+import dotenv
 
 _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+# launchd often leaves cwd at / or /var/root — load repo .env (parent of src/).
+_REPO_ROOT = _SRC.parent
+dotenv.load_dotenv(_REPO_ROOT / ".env")
+dotenv.load_dotenv()
 
 
 def _workspace_root() -> Path:

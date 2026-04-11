@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +20,65 @@ from deepagents.backends import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.errors import GraphRecursionError
 
 from runtime.shell_policy import PolicyGuardShellBackend
 from runtime.todos import memory_system_prompt_appendix
 
 logger = logging.getLogger(__name__)
+
+# Synthetic user turn when the graph hits ``recursion_limit`` (SPEC-style sleep boundary).
+_RECURSION_LIMIT_SLEEP_MESSAGE = (
+    "Go to Sleep\n\n"
+    "[Runtime: recursion/step limit was reached before the agent finished normally. "
+    "Follow your Go to Sleep instructions: update TODOS.md so incomplete tasks are accurate, "
+    "then reply briefly if the user should see something, or end with SILENT if not.]"
+)
+
+
+_DEFAULT_OLLAMA_MODEL = "gemma4"
+
+
+def _env_ollama_model_fallback() -> str:
+    for key in ("OLLAMA_MODEL", "BOYOCLAW_OLLAMA_MODEL"):
+        raw = os.environ.get(key)
+        if raw and str(raw).strip():
+            return str(raw).strip()
+    return _DEFAULT_OLLAMA_MODEL
+
+
+def _ensure_chat_model(model: str | BaseChatModel | None) -> str | BaseChatModel | None:
+    """Avoid empty Ollama model id (pydantic / env can yield ``model=''`` and break requests)."""
+    if model is None:
+        return None
+    if isinstance(model, str):
+        s = model.strip()
+        return s if s else _env_ollama_model_fallback()
+    mid = getattr(model, "model", None)
+    if isinstance(mid, str) and not mid.strip():
+        fb = _env_ollama_model_fallback()
+        model_copy = getattr(model, "model_copy", None)
+        if callable(model_copy):
+            return model_copy(update={"model": fb})
+        logger.warning("Chat model has empty model id and no model_copy(); requests may fail")
+    return model
+
+
+def _state_from_langgraph_stream_chunk(chunk: Any) -> Any | None:
+    """Extract state snapshot the same way LangGraph ``ainvoke`` does (``mode == 'values'``)."""
+    # Some runners emit the state dict directly.
+    if isinstance(chunk, dict) and "messages" in chunk:
+        return chunk
+    if not isinstance(chunk, tuple) or len(chunk) < 2:
+        return None
+    if len(chunk) == 2:
+        mode, payload = chunk
+    else:
+        mode, payload = chunk[-2], chunk[-1]
+    if mode == "values":
+        return payload
+    return None
+
 
 # When set, ``execute`` can route to the audio sidecar (``BOYOCLAW_AUDIO_DOCKER_IMAGE``) by
 # prefixing the command with this marker (host ``docker exec`` — no Docker socket in the sandbox).
@@ -100,7 +155,34 @@ DOCKER_WORKSPACE_LABEL_VERSION = "v2-inner-agent-home"
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    """Filesystem root of the BoyoClaw repo (contains ``skills/project/``).
+
+    Under **launchd**, ``cwd`` is often ``/`` or unrelated, so we must not rely on
+    working directory. Resolution order:
+
+    1. ``BOYOCLAW_PROJECT_ROOT`` if set and the path exists.
+    2. Walk parents of this file for a directory containing ``skills/project/``.
+    3. Legacy: two parents above ``agent.py`` (``src/`` layout).
+    """
+    env = (os.environ.get("BOYOCLAW_PROJECT_ROOT") or "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        if p.is_dir():
+            return p
+        logger.warning("BOYOCLAW_PROJECT_ROOT is not a directory (%s); ignoring", p)
+    start = Path(__file__).resolve()
+    for base in (start.parent, *start.parents):
+        marker = base / "skills" / "project"
+        if marker.is_dir():
+            return base
+    root = start.parent.parent
+    logger.warning(
+        "Could not find skills/project/ from %s; using legacy root %s. "
+        "Set BOYOCLAW_PROJECT_ROOT to the repo root (folder that contains skills/).",
+        start,
+        root,
+    )
+    return root
 
 
 def default_sandbox_directory() -> Path:
@@ -116,6 +198,25 @@ def _agent_home_sync_state_path(sandbox_root: Path) -> Path:
     return Path(sandbox_root).resolve() / ".agent-home-sync-state.json"
 
 
+def _agent_home_sync_path_excluded(rel: str) -> bool:
+    """Paths under ``.agent-home`` that must not be merged with Docker (noise / not portable)."""
+    if not rel or rel in (".", ".."):
+        return True
+    # macOS app support + Python caches (e.g. pip under Library/Caches/...) — huge, non-portable, docker mkdir fails.
+    if rel == "Library" or rel.startswith("Library/"):
+        return True
+    # pip http cache, Playwright browsers, HuggingFace, etc. — churning files; docker cp races and fails often.
+    if rel == ".cache" or rel.startswith(".cache/"):
+        return True
+    if rel.endswith(".DS_Store"):
+        return True
+    return False
+
+
+def _filter_sync_path_map(m: dict[str, int]) -> dict[str, int]:
+    return {k: v for k, v in m.items() if not _agent_home_sync_path_excluded(k)}
+
+
 def _scan_host_agent_home_files(agent_home: Path) -> dict[str, int]:
     """Map relative posix path -> mtime_ns for regular files (no symlinks)."""
     agent_home = Path(agent_home).resolve()
@@ -128,6 +229,8 @@ def _scan_host_agent_home_files(agent_home: Path) -> dict[str, int]:
         try:
             rel = p.relative_to(agent_home).as_posix()
         except ValueError:
+            continue
+        if _agent_home_sync_path_excluded(rel):
             continue
         try:
             out[rel] = p.stat().st_mtime_ns
@@ -164,7 +267,8 @@ def _scan_docker_inner_files(container: str, inner_root: str) -> dict[str, int]:
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()
         raise RuntimeError(f"docker file scan failed: {err}")
-    return json.loads(r.stdout or "{}")
+    raw: dict[str, int] = json.loads(r.stdout or "{}")
+    return _filter_sync_path_map(raw)
 
 
 def _load_sync_snapshot(path: Path) -> tuple[set[str], set[str]]:
@@ -185,12 +289,48 @@ def _save_sync_snapshot(path: Path, in_h: set[str], in_d: set[str]) -> None:
     path.write_text(json.dumps(payload, indent=0) + "\n", encoding="utf-8")
 
 
+def _format_sync_subprocess_error(exc: BaseException) -> str:
+    """Include docker stderr/stdout so logs show 'no space', 'not running', etc."""
+    if isinstance(exc, subprocess.CalledProcessError):
+        parts: list[str] = [str(exc)]
+        err = (exc.stderr or "").strip()
+        out = (exc.stdout or "").strip()
+        if err:
+            parts.append(f"stderr: {err[:4000]}")
+        if out:
+            parts.append(f"stdout: {out[:1000]}")
+        return " | ".join(parts)
+    return str(exc)
+
+
+def _docker_subprocess_run(
+    cmd: list[str],
+    *,
+    timeout: int,
+    attempts: int = 3,
+) -> subprocess.CompletedProcess:
+    """Run a docker CLI command; retry a few times on transient Desktop/daemon flakes."""
+    last: subprocess.CalledProcessError | None = None
+    for attempt in range(attempts):
+        try:
+            return subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.CalledProcessError as e:
+            last = e
+            if attempt < attempts - 1:
+                time.sleep(0.2 * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 def _docker_exec_mkdir_p(container: str, posix_dir: str) -> None:
-    subprocess.run(
+    _docker_subprocess_run(
         ["docker", "exec", "-i", container, "mkdir", "-p", posix_dir],
-        check=True,
-        capture_output=True,
-        text=True,
         timeout=60,
     )
 
@@ -204,11 +344,8 @@ def _copy_host_to_docker_inner(
     dest_container = f"{CONTAINER_INNER_AGENT_HOME}/{rel}"
     parent = str(Path(dest_container).parent.as_posix())
     _docker_exec_mkdir_p(container, parent)
-    subprocess.run(
+    _docker_subprocess_run(
         ["docker", "cp", str(src.resolve()), f"{container}:{dest_container}"],
-        check=True,
-        capture_output=True,
-        text=True,
         timeout=300,
     )
 
@@ -221,11 +358,8 @@ def _copy_docker_inner_to_host(
     dest = host_agent_home / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     src_container = f"{CONTAINER_INNER_AGENT_HOME}/{rel}"
-    subprocess.run(
+    _docker_subprocess_run(
         ["docker", "cp", f"{container}:{src_container}", str(dest.resolve())],
-        check=True,
-        capture_output=True,
-        text=True,
         timeout=300,
     )
 
@@ -259,14 +393,24 @@ def sync_bundled_skills_to_sandbox(sandbox_root: Path) -> None:
     """Copy ``<project>/skills/`` into ``<sandbox>/skills/`` so SKILL.md paths resolve."""
     src = bundled_skills_source()
     if not src.is_dir():
+        logger.warning(
+            "Bundled skills directory missing at %s — skills will be empty unless synced manually. "
+            "Set BOYOCLAW_PROJECT_ROOT to the repo root (the folder that contains skills/).",
+            src,
+        )
         return
     dest = sandbox_root / "skills"
     dest.mkdir(parents=True, exist_ok=True)
+    copied = 0
     for item in src.iterdir():
         if item.is_dir():
             shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+            copied += 1
         elif item.is_file():
             shutil.copy2(item, dest / item.name)
+            copied += 1
+    if copied == 0:
+        logger.warning("Bundled skills directory %s is empty; nothing copied to %s", src, dest)
 
 
 def docker_available() -> bool:
@@ -301,7 +445,41 @@ def _docker_audio_container_name_for_sandbox(sandbox_root: Path) -> str:
     return f"boyoclaw-audio-{digest}"
 
 
-class PersistentDockerShellBackend(LocalShellBackend):
+class BoyoClawLocalShellBackend(LocalShellBackend):
+    """LocalShellBackend with friendlier path resolution for agent-home.
+
+    Deepagents :func:`validate_path` turns relative paths into **slash-rooted virtual**
+    paths (e.g. ``telegram_uploads/x.jpg`` → ``/telegram_uploads/x.jpg``). With
+    ``virtual_mode=False``, :class:`FilesystemBackend` treats those as OS-absolute,
+    so they incorrectly resolve under ``/`` instead of ``.agent-home``. When the
+    OS path does not exist but the same relative path under ``cwd`` (agent home) does,
+    use the latter. Real paths (e.g. ``/Users/...``) that exist on disk are unchanged.
+    """
+
+    def _resolve_path(self, key: str) -> Path:
+        if self.virtual_mode:
+            return super()._resolve_path(key)
+        p = Path(key)
+        cwd = self.cwd.resolve()
+        if p.is_absolute():
+            try:
+                at_fs = p.resolve()
+            except (OSError, RuntimeError):
+                at_fs = p
+            if not at_fs.exists():
+                rel = p.as_posix().lstrip("/")
+                if rel:
+                    candidate = (cwd / rel).resolve()
+                    try:
+                        candidate.relative_to(cwd)
+                    except ValueError:
+                        return super()._resolve_path(key)
+                    if candidate.exists():
+                        return candidate
+        return super()._resolve_path(key)
+
+
+class PersistentDockerShellBackend(BoyoClawLocalShellBackend):
     """One long-lived container per workspace; ``execute`` uses host ``docker exec``.
 
     The **user-facing** host tree stays at ``<workspace>/.agent-home`` (bind-mounted at
@@ -410,6 +588,8 @@ class PersistentDockerShellBackend(LocalShellBackend):
         host_home = self._host_agent_home
         state_path = _agent_home_sync_state_path(self._sandbox_root)
         prev_h, prev_d = _load_sync_snapshot(state_path)
+        prev_h = {p for p in prev_h if not _agent_home_sync_path_excluded(p)}
+        prev_d = {p for p in prev_d if not _agent_home_sync_path_excluded(p)}
 
         h_files = _scan_host_agent_home_files(host_home)
         try:
@@ -450,6 +630,8 @@ class PersistentDockerShellBackend(LocalShellBackend):
 
         in_h, in_d = set(h_files), set(d_files)
         for p in sorted(in_h | in_d):
+            if _agent_home_sync_path_excluded(p):
+                continue
             hi, di = p in in_h, p in in_d
             try:
                 if hi and di:
@@ -463,7 +645,11 @@ class PersistentDockerShellBackend(LocalShellBackend):
                 else:
                     _copy_docker_inner_to_host(host_home, self._container_name, p)
             except Exception as e:  # noqa: BLE001
-                logger.warning("agent-home sync: failed on %r: %s", p, e)
+                logger.warning(
+                    "agent-home sync: failed on %r: %s",
+                    p,
+                    _format_sync_subprocess_error(e),
+                )
 
         h_final = set(_scan_host_agent_home_files(host_home).keys())
         try:
@@ -921,7 +1107,7 @@ def create_local_isolated_backend(
                 "Docker not found; using host LocalShellBackend with virtual_mode=False. "
                 "Install Docker to enable container-isolated execute().",
             )
-        inner_backend = LocalShellBackend(
+        inner_backend = BoyoClawLocalShellBackend(
             root_dir=agent_home,
             virtual_mode=False,
             inherit_env=False,
@@ -984,12 +1170,13 @@ class SandboxedAssistant:
             prefer_docker=prefer_docker_isolation,
         )
         tools_arg: list[Any] | None = list(extra_tools) if extra_tools else None
-        memory_block = memory_system_prompt_appendix("MEMORY.md")
+        memory_block = memory_system_prompt_appendix(self.agent_home / "MEMORY.md")
         base_prompt = (system_prompt or "").strip()
         if base_prompt:
             full_system_prompt = f"{base_prompt}\n\n{memory_block}"
         else:
             full_system_prompt = memory_block
+        model = _ensure_chat_model(model)
         self._graph = create_deep_agent(
             model=model,
             backend=backend,
@@ -1008,10 +1195,55 @@ class SandboxedAssistant:
         except Exception as e:  # noqa: BLE001
             logger.warning("agent-home sync (%s) failed: %s", stage, e)
 
+    def sync_agent_home_before_host_access(self, *, stage: str = "pre-host-access") -> None:
+        """Bidirectional inner↔host ``.agent-home`` sync when Docker is enabled.
+
+        ``read_file`` / ``glob`` / Telegram ``send_file_to_user`` use **host** paths.
+        ``execute`` in Docker writes the **inner** copy first. Call this before validating
+        or opening a path on the host when the file may have just been created in the
+        container (same agent turn). No-op without Docker.
+        """
+        self._sync_agent_home_with_docker(stage)
+
+    def _sync_go_to_sleep_after_recursion_limit(
+        self,
+        latest: dict[str, Any],
+        *,
+        recursion_limit: int,
+    ) -> dict[str, Any]:
+        logger.warning(
+            "Agent hit recursion_limit=%s; running synthetic Go to Sleep wrap-up turn",
+            recursion_limit,
+        )
+        prior = latest["messages"]
+        follow = list(prior) + [HumanMessage(content=_RECURSION_LIMIT_SLEEP_MESSAGE)]
+        return self._graph.invoke(
+            {"messages": follow},
+            config={"recursion_limit": recursion_limit},
+        )
+
+    async def _async_go_to_sleep_after_recursion_limit(
+        self,
+        latest: dict[str, Any],
+        *,
+        recursion_limit: int,
+    ) -> dict[str, Any]:
+        logger.warning(
+            "Agent hit recursion_limit=%s; running synthetic Go to Sleep wrap-up turn",
+            recursion_limit,
+        )
+        prior = latest["messages"]
+        follow = list(prior) + [HumanMessage(content=_RECURSION_LIMIT_SLEEP_MESSAGE)]
+        return await self._graph.ainvoke(
+            {"messages": follow},
+            config={"recursion_limit": recursion_limit},
+        )
+
     def run(
         self,
         user_message: str,
         *,
+        recursion_limit: int = 300,
         system_appendix: str | None = None,
         prior_messages: list[HumanMessage | AIMessage] | None = None,
         retrieval_system_block: str | None = None,
@@ -1025,8 +1257,37 @@ class SandboxedAssistant:
         for m in prior_messages or []:
             msgs.append(m)
         msgs.append(HumanMessage(content=user_message))
+        cfg = {"recursion_limit": recursion_limit}
+        latest: Any = None
         try:
-            return self._graph.invoke({"messages": msgs})
+            try:
+                for chunk in self._graph.stream(
+                    {"messages": msgs},
+                    config=cfg,
+                    stream_mode=["updates", "values"],
+                ):
+                    snap = _state_from_langgraph_stream_chunk(chunk)
+                    if snap is not None:
+                        latest = snap
+            except GraphRecursionError:
+                if (
+                    latest is None
+                    or not isinstance(latest, dict)
+                    or not isinstance(latest.get("messages"), list)
+                ):
+                    raise
+                result = self._sync_go_to_sleep_after_recursion_limit(
+                    latest,
+                    recursion_limit=recursion_limit,
+                )
+            else:
+                if latest is None:
+                    raise RuntimeError(
+                        "LangGraph stream completed without any 'values' state snapshot "
+                        "(unexpected for this agent; check langgraph/langchain versions).",
+                    )
+                result = latest
+            return result
         finally:
             self._sync_agent_home_with_docker("post-invoke")
 
@@ -1039,7 +1300,7 @@ class SandboxedAssistant:
         prior_messages: list[HumanMessage | AIMessage] | None = None,
         retrieval_system_block: str | None = None,
     ) -> dict[str, Any]:
-        """Async single-turn invoke (SPEC sleep boundary uses recursion limit)."""
+        """Async single-turn invoke; at recursion limit appends a synthetic Go to Sleep turn."""
         msgs: list[HumanMessage | SystemMessage | AIMessage] = []
         if system_appendix and system_appendix.strip():
             msgs.append(SystemMessage(content=system_appendix.strip()))
@@ -1048,11 +1309,37 @@ class SandboxedAssistant:
         for m in prior_messages or []:
             msgs.append(m)
         msgs.append(HumanMessage(content=user_message))
+        cfg = {"recursion_limit": recursion_limit}
+        latest: Any = None
         try:
-            return await self._graph.ainvoke(
-                {"messages": msgs},
-                config={"recursion_limit": recursion_limit},
-            )
+            try:
+                async for chunk in self._graph.astream(
+                    {"messages": msgs},
+                    config=cfg,
+                    stream_mode=["updates", "values"],
+                ):
+                    snap = _state_from_langgraph_stream_chunk(chunk)
+                    if snap is not None:
+                        latest = snap
+            except GraphRecursionError:
+                if (
+                    latest is None
+                    or not isinstance(latest, dict)
+                    or not isinstance(latest.get("messages"), list)
+                ):
+                    raise
+                result = await self._async_go_to_sleep_after_recursion_limit(
+                    latest,
+                    recursion_limit=recursion_limit,
+                )
+            else:
+                if latest is None:
+                    raise RuntimeError(
+                        "LangGraph stream completed without any 'values' state snapshot "
+                        "(unexpected for this agent; check langgraph/langchain versions).",
+                    )
+                result = latest
+            return result
         finally:
             self._sync_agent_home_with_docker("post-invoke")
 
@@ -1062,7 +1349,7 @@ if __name__ == "__main__":
 
     agent = SandboxedAssistant(
         sandbox_root=Path("./.boyoclaw"),
-        model=ChatOllama(model="minimax-m2.7:cloud"),
+        model=ChatOllama(model="gemma4"),
         prefer_docker_isolation=True,
         system_prompt="You are a helpful assistant that can help with tasks and answer questions.",
     )

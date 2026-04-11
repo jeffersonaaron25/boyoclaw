@@ -34,7 +34,7 @@ def build_inbox_tools(
             "If true (default), mark fetched human messages as read after returning them.",
         ] = True,
     ) -> str:
-        """Fetch unread human messages from the inbox."""
+        """Fetch unread human messages from your inbox."""
         rows = inbox.fetch_unread_human(mark_as_read=mark_as_read)
         return json.dumps({"unread": rows, "count": len(rows)}, indent=2)
 
@@ -47,12 +47,12 @@ def build_inbox_tools(
     ) -> str:
         """Read the most recent inbox messages (human and assistant) for quick context.
 
-        Not the same as unread messages: this is a fixed tail of the thread. Any human message
-        in this window that was still unread is marked read so it will not appear again in
-        fetch_unread_messages.
+        Not the same as unread messages: this is a fixed tail of the thread. Human **unread**
+        state is unchanged here so lines queued while another turn runs stay unread until
+        ``fetch_unread_messages`` or until that line’s turn reaches the model.
         """
         lim = max(1, min(limit, 25))
-        rows = inbox.fetch_recent_messages(limit=lim)
+        rows = inbox.fetch_recent_messages(limit=lim, mark_read_in_window=False)
         return json.dumps({"messages": rows, "count": len(rows)}, indent=2)
 
     @tool
@@ -68,15 +68,22 @@ def build_inbox_tools(
     def schedule_wake(
         when_iso: Annotated[
             str,
-            "When to wake you: ISO 8601 datetime strictly in the future "
-            "(e.g. 2026-03-24T09:00:00-07:00 or 2026-03-24T16:00:00Z).",
+            "When the wake fires: ISO 8601 datetime strictly in the future. "
+            "Always include a timezone: offset (e.g. -07:00 for US Pacific) or Z for UTC—never naive local time without offset. "
+            "The stored instant is absolute; 09:00-07:00 and 16:00Z are different clocks. "
+            "If the user says 'morning', use an actual morning hour in their zone (e.g. 08:00 or 09:00), not 15:00. "
+            "If their timezone is unclear, infer from context (travel, city) or ask once; do not assume UTC. "
+            "Examples: 2026-03-24T08:30:00-07:00, 2026-03-24T15:30:00Z.",
         ],
         context: Annotated[
             str,
             "Why this wake exists; you will see it again when the alarm fires (keep it actionable).",
         ],
     ) -> str:
-        """Schedule a future Wake Up with saved context. The record is removed after that wake runs."""
+        """Schedule a future Wake Up with saved context.
+
+        Times must be unambiguous (offset or Z). Align prose with the ISO instant—do not
+        call a 15:00 local wake 'morning'."""
         from runtime.scheduled_wake import schedule_wake_add
 
         tc = current_telegram_chat_id() if current_telegram_chat_id else None
@@ -99,28 +106,6 @@ def build_inbox_tools(
         For interactive turns that use a skill/long-running work, send one short acknowledgement first,
         then send one final reply when done.
         """
-        # Remove Markdown formatting: asterisks, underscores, backticks, and tildes only when used in Markdown constructs—not inside words or numbers.
-        import re
-        def _remove_markdown_formatting(msg: str) -> str:
-            # Remove **bold**, *italic*, __under__, _under_, ***word***, ~~strike~~, and `inline code`.
-            # Handles multi-line, block, and leading list/heading markdown (e.g. "- **foo**").
-            # Remove list/heading markdown tokens at line start
-            msg = re.sub(r'^[\s>*-]+', '', msg, flags=re.MULTILINE)
-            # Remove bold/italic/underline combos: ***, ___, **, __, *, _
-            msg = re.sub(r'(\*\*\*|___)(.*?)\1', r'\2', msg, flags=re.DOTALL)
-            msg = re.sub(r'(\*\*|__)(.*?)\1', r'\2', msg, flags=re.DOTALL)
-            msg = re.sub(r'(\*|_)(.*?)\1', r'\2', msg, flags=re.DOTALL)
-            # Inline code: `code`
-            msg = re.sub(r'`([^`]*)`', r'\1', msg)
-            # Strikethrough: ~~strike~~
-            msg = re.sub(r'~~([^~]*)~~', r'\1', msg)
-            # Remove bold/italic applied only to part of line (catch leftovers)
-            msg = re.sub(r'(\*{1,3}|_{1,3})(\S.*?)\1', r'\2', msg)
-            # Remove excess whitespace, leading/trailing spacing
-            msg = re.sub(r' +', ' ', msg)
-            return msg.strip()
-
-        message = _remove_markdown_formatting(message)
         inbox.add_assistant(message)
         if delivery is not None:
             delivery.reply_via_tool = True

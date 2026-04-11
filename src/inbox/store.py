@@ -55,6 +55,81 @@ def _l2_normalize_rows(arr: Any) -> Any:
     return arr / norms
 
 
+# MMR: trade off query relevance vs. diversity so near-duplicate assistant lines
+# (e.g. repeated packing replies) do not fill the result list.
+_DEFAULT_MMR_LAMBDA = 0.55
+_DEFAULT_MMR_FETCH_MULT = 6
+_DEFAULT_MMR_FETCH_MIN_EXTRA = 20
+
+
+def _faiss_mmr_indices(
+    query_vec_flat: Any,
+    candidate_faiss_indices: list[int],
+    candidate_scores: list[float],
+    index: Any,
+    k: int,
+    *,
+    lambda_mult: float = _DEFAULT_MMR_LAMBDA,
+) -> list[int]:
+    """Pick up to ``k`` FAISS row ids using maximal marginal relevance.
+
+    ``candidate_*`` must be parallel lists (same length). ``query_vec_flat`` is a single
+    L2-normalized embedding (1D). Vectors in the index are assumed L2-normalized so
+    dot products equal cosine similarity.
+    """
+    if np is None:
+        raise RuntimeError("numpy required")
+    if not candidate_faiss_indices or k <= 0:
+        return []
+    k = min(k, len(candidate_faiss_indices))
+    if k == 1:
+        best_i = max(range(len(candidate_scores)), key=lambda i: candidate_scores[i])
+        return [candidate_faiss_indices[best_i]]
+
+    vecs: list[Any] = []
+    kept_positions: list[int] = []
+    for pos, fi in enumerate(candidate_faiss_indices):
+        try:
+            v = index.reconstruct(int(fi))
+        except Exception:
+            logger.debug("FAISS reconstruct failed for row %s", fi, exc_info=True)
+            continue
+        vecs.append(np.asarray(v, dtype=np.float32).reshape(-1))
+        kept_positions.append(pos)
+
+    if not vecs:
+        return candidate_faiss_indices[:k]
+
+    D = np.stack(vecs, axis=0)
+    rel = np.array([candidate_scores[p] for p in kept_positions], dtype=np.float32)
+    faiss_ids = [candidate_faiss_indices[p] for p in kept_positions]
+    n = D.shape[0]
+    k = min(k, n)
+    sim = D @ D.T
+
+    first = int(np.argmax(rel))
+    selected_local: list[int] = [first]
+    selected_set = {first}
+
+    while len(selected_local) < k:
+        best_j = -1
+        best_mmr = -np.inf
+        for j in range(n):
+            if j in selected_set:
+                continue
+            max_sim_to_sel = max(sim[j, s] for s in selected_local)
+            mmr = lambda_mult * rel[j] - (1.0 - lambda_mult) * max_sim_to_sel
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_j = j
+        if best_j < 0:
+            break
+        selected_local.append(best_j)
+        selected_set.add(best_j)
+
+    return [faiss_ids[i] for i in selected_local]
+
+
 class MessageInbox:
     """Message store: SQLite + optional FAISS (Ollama ``nomic-embed-text`` + faiss-cpu)."""
 
@@ -245,6 +320,14 @@ class MessageInbox:
         self._append_vector(mid, content)
         return mid
 
+    def mark_human_read(self, message_id: str) -> None:
+        """Set ``is_read`` for a human row (no-op if already read or missing)."""
+        self._conn.execute(
+            "UPDATE messages SET is_read = 1 WHERE id = ? AND type = 'human'",
+            (message_id,),
+        )
+        self._conn.commit()
+
     def add_assistant(self, content: str) -> str:
         mid = str(uuid.uuid4())
         self._conn.execute(
@@ -389,7 +472,14 @@ class MessageInbox:
 
         return out
 
-    def search_semantic(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def search_semantic(
+        self,
+        query: str,
+        limit: int,
+        *,
+        use_mmr: bool = True,
+        mmr_lambda: float | None = None,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 50))
         if (
             _HAS_FAISS
@@ -399,11 +489,52 @@ class MessageInbox:
         ):
             try:
                 q = self._encode_query_vector(query)
-                scores, indices = self._index.search(q, min(limit, self._index.ntotal))
-                results: list[dict[str, Any]] = []
+                ntotal = int(self._index.ntotal)
+                lam = (
+                    float(mmr_lambda)
+                    if mmr_lambda is not None
+                    else _DEFAULT_MMR_LAMBDA
+                )
+                lam = max(0.0, min(1.0, lam))
+
+                if use_mmr and ntotal > 1 and limit > 1:
+                    fetch_k = min(
+                        ntotal,
+                        max(limit * _DEFAULT_MMR_FETCH_MULT, limit + _DEFAULT_MMR_FETCH_MIN_EXTRA),
+                    )
+                else:
+                    fetch_k = min(limit, ntotal)
+
+                scores, indices = self._index.search(q, fetch_k)
+                cand_idx: list[int] = []
+                cand_score: list[float] = []
+                seen_mid: set[str] = set()
                 for score, idx in zip(scores[0], indices[0]):
-                    if idx < 0 or idx >= len(self._faiss_ids):
+                    ii = int(idx)
+                    if ii < 0 or ii >= len(self._faiss_ids):
                         continue
+                    mid = self._faiss_ids[ii]
+                    if mid in seen_mid:
+                        continue
+                    seen_mid.add(mid)
+                    cand_idx.append(ii)
+                    cand_score.append(float(score))
+
+                if use_mmr and len(cand_idx) > 1 and limit > 1:
+                    chosen = _faiss_mmr_indices(
+                        q.reshape(-1),
+                        cand_idx,
+                        cand_score,
+                        self._index,
+                        limit,
+                        lambda_mult=lam,
+                    )
+                else:
+                    chosen = cand_idx[:limit]
+
+                score_by_faiss = dict(zip(cand_idx, cand_score))
+                results: list[dict[str, Any]] = []
+                for idx in chosen:
                     mid = self._faiss_ids[idx]
                     row = self._conn.execute(
                         "SELECT id, created_at, type, content, is_read FROM messages WHERE id = ?",
@@ -417,7 +548,7 @@ class MessageInbox:
                                 "type": row["type"],
                                 "content": row["content"],
                                 "is_read": bool(row["is_read"]),
-                                "score": float(score),
+                                "score": float(score_by_faiss.get(idx, 0.0)),
                             }
                         )
                 return results
